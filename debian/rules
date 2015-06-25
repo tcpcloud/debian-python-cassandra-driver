@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@ --with python2,python3
+
+override_dh_install:
+	python  setup.py install --install-layout=deb --root $(CURDIR)/debian/python-cassandra
+	python3 setup.py install --install-layout=deb --root $(CURDIR)/debian/python3-cassandra
+
+override_dh_installdocs:
+	dh_installdocs README.rst

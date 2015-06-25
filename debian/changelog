@@ -1,0 +1,5 @@
+python-cassandra-driver (2.5.1-1) unstable; urgency=low
+
+  * Initial release (Closes: #771065)
+
+ -- Sandro Tosi <morph@debian.org>  Thu, 25 Jun 2015 15:50:21 -0400

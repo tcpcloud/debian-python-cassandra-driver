@@ -1,0 +1,52 @@
+Source: python-cassandra-driver
+Section: python
+Priority: optional
+Maintainer: Sandro Tosi <morph@debian.org>
+Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.org>
+Build-Depends: debhelper (>= 9), python, python3, python-setuptools, python3-setuptools
+Standards-Version: 3.9.6
+Homepage: https://github.com/datastax/python-driver
+Vcs-Git: git://anonscm.debian.org/python-modules/packages/python-cassandra-driver.git
+Vcs-Browser: http://anonscm.debian.org/cgit/python-modules/packages/python-cassandra-driver.git
+
+Package: python-cassandra
+Architecture: all
+Depends: ${python:Depends}, ${misc:Depends}
+Suggests: python-snappy, python-lz4, python-blist
+Description: Python driver for Apache Cassandra
+ A modern, feature-rich and highly-tunable Python client library for Apache
+ Cassandra (1.2+) and DataStax Enterprise (3.1+) using exclusively Cassandra's
+ binary protocol and Cassandra Query Language v3.
+ .
+ Features:
+  * Synchronous and Asynchronous APIs
+  * Simple, Prepared, and Batch statements
+  * Asynchronous IO, parallel execution, request pipelining
+  * Connection pooling
+  * Automatic node discovery
+  * Automatic reconnection
+  * Configurable load balancing and retry policies
+  * Concurrent execution utilities
+  * Object mapper
+
+Package: python3-cassandra
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends}
+Suggests: python3-blist
+Description: Python driver for Apache Cassandra (Python 3)
+ A modern, feature-rich and highly-tunable Python client library for Apache
+ Cassandra (1.2+) and DataStax Enterprise (3.1+) using exclusively Cassandra's
+ binary protocol and Cassandra Query Language v3.
+ .
+ Features:
+  * Synchronous and Asynchronous APIs
+  * Simple, Prepared, and Batch statements
+  * Asynchronous IO, parallel execution, request pipelining
+  * Connection pooling
+  * Automatic node discovery
+  * Automatic reconnection
+  * Configurable load balancing and retry policies
+  * Concurrent execution utilities
+  * Object mapper
+ .
+ This package contains the Python 3.x module for python-cassandra
