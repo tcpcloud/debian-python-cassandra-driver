@@ -1,3 +1,9 @@
+python-cassandra-driver (3.1.1-0tcp2) jessie; urgency=medium
+
+  * Fix priority typo
+
+ -- Filip Pytloun <filip@pytloun.cz>  Tue, 22 Mar 2016 17:03:16 +0100
+
 python-cassandra-driver (3.1.1-0tcp1) trusty; urgency=medium
 
   * New upstream version
