@@ -1,4 +1,4 @@
-python-cassandra-driver (3.1.1-0tcp2) jessie; urgency=medium
+python-cassandra-driver (3.1.1-0tcp3) trusty; urgency=medium
 
   * Fix priority typo
 
