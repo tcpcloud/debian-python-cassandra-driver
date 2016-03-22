@@ -1,7 +1,8 @@
 Source: python-cassandra-driver
 Section: python
-Priority: optional
-Maintainer: Sandro Tosi <morph@debian.org>
+Priority: optioonal
+Maintainer: tcpcloud Packaging Team <pkg@tcpcloud.eu>  
+XSBC-Original-Maintainer: Sandro Tosi <morph@debian.org>
 Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.org>
 Build-Depends: debhelper (>= 9), python, python3, python-setuptools, python3-setuptools
 Standards-Version: 3.9.6
