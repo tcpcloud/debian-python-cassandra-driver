@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -173,7 +173,7 @@ class RoundRobinPolicy(LoadBalancingPolicy):
         length = len(hosts)
         if length:
             pos %= length
-            return list(islice(cycle(hosts), pos, pos + length))
+            return islice(cycle(hosts), pos, pos + length)
         else:
             return []
 
@@ -509,14 +509,16 @@ class ConstantReconnectionPolicy(ReconnectionPolicy):
         """
         if delay < 0:
             raise ValueError("delay must not be negative")
-        if max_attempts < 0:
+        if max_attempts is not None and max_attempts < 0:
             raise ValueError("max_attempts must not be negative")
 
         self.delay = delay
         self.max_attempts = max_attempts
 
     def new_schedule(self):
-        return repeat(self.delay, self.max_attempts)
+        if self.max_attempts:
+            return repeat(self.delay, self.max_attempts)
+        return repeat(self.delay)
 
 
 class ExponentialReconnectionPolicy(ReconnectionPolicy):
@@ -526,10 +528,17 @@ class ExponentialReconnectionPolicy(ReconnectionPolicy):
     a set maximum delay.
     """
 
-    def __init__(self, base_delay, max_delay):
+    # TODO: max_attempts is 64 to preserve legacy default behavior
+    # consider changing to None in major release to prevent the policy
+    # giving up forever
+    def __init__(self, base_delay, max_delay, max_attempts=64):
         """
         `base_delay` and `max_delay` should be in floating point units of
         seconds.
+
+        `max_attempts` should be a total number of attempts to be made before
+        giving up, or :const:`None` to continue reconnection attempts forever.
+        The default is 64.
         """
         if base_delay < 0 or max_delay < 0:
             raise ValueError("Delays may not be negative")
@@ -537,11 +546,18 @@ class ExponentialReconnectionPolicy(ReconnectionPolicy):
         if max_delay < base_delay:
             raise ValueError("Max delay must be greater than base delay")
 
+        if max_attempts is not None and max_attempts < 0:
+            raise ValueError("max_attempts must not be negative")
+
         self.base_delay = base_delay
         self.max_delay = max_delay
+        self.max_attempts = max_attempts
 
     def new_schedule(self):
-        return (min(self.base_delay * (2 ** i), self.max_delay) for i in range(64))
+        i=0
+        while self.max_attempts == None or i < self.max_attempts:
+            yield min(self.base_delay * (2 ** i), self.max_delay)
+            i += 1
 
 
 class WriteType(object):
@@ -597,8 +613,13 @@ WriteType.name_to_value = {
 
 class RetryPolicy(object):
     """
-    A policy that describes whether to retry, rethrow, or ignore timeout
-    and unavailable failures.
+    A policy that describes whether to retry, rethrow, or ignore coordinator
+    timeout and unavailable failures. These are failures reported from the
+    server side. Timeouts are configured by
+    `settings in cassandra.yaml <https://github.com/apache/cassandra/blob/cassandra-2.1.4/conf/cassandra.yaml#L568-L584>`_.
+    Unavailable failures occur when the coordinator cannot acheive the consistency
+    level for a request. For further information see the method descriptions
+    below.
 
     To specify a default retry policy, set the
     :attr:`.Cluster.default_retry_policy` attribute to an instance of this
@@ -809,14 +830,19 @@ class DowngradingConsistencyRetryPolicy(RetryPolicy):
                          required_responses, received_responses, retry_num):
         if retry_num != 0:
             return (self.RETHROW, None)
-        elif write_type in (WriteType.SIMPLE, WriteType.BATCH, WriteType.COUNTER):
-            return (self.IGNORE, None)
+
+        if write_type in (WriteType.SIMPLE, WriteType.BATCH, WriteType.COUNTER):
+            if received_responses > 0:
+                # persisted on at least one replica
+                return (self.IGNORE, None)
+            else:
+                return (self.RETHROW, None)
         elif write_type == WriteType.UNLOGGED_BATCH:
             return self._pick_consistency(received_responses)
         elif write_type == WriteType.BATCH_LOG:
             return (self.RETRY, consistency)
-        else:
-            return (self.RETHROW, None)
+
+        return (self.RETHROW, None)
 
     def on_unavailable(self, query, consistency, required_replicas, alive_replicas, retry_num):
         if retry_num != 0:

@@ -1,5 +1,5 @@
 # Copyright 2014 Symantec Corporation
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,21 +16,19 @@
 # Originally derived from MagnetoDB source:
 #   https://github.com/stackforge/magnetodb/blob/2015.1.0b1/magnetodb/common/cassandra/io/eventletreactor.py
 
-from collections import defaultdict
 from errno import EALREADY, EINPROGRESS, EWOULDBLOCK, EINVAL
 import eventlet
-from eventlet.green import select, socket
+from eventlet.green import socket
+import ssl
 from eventlet.queue import Queue
-from functools import partial
 import logging
 import os
 from threading import Event
+import time
 
 from six.moves import xrange
 
-from cassandra import OperationTimedOut
-from cassandra.connection import Connection, ConnectionShutdown
-from cassandra.protocol import RegisterMessage
+from cassandra.connection import Connection, ConnectionShutdown, Timer, TimerManager
 
 
 log = logging.getLogger(__name__)
@@ -39,69 +37,65 @@ log = logging.getLogger(__name__)
 def is_timeout(err):
     return (
         err in (EINPROGRESS, EALREADY, EWOULDBLOCK) or
-        (err == EINVAL and os.name in ('nt', 'ce'))
+        (err == EINVAL and os.name in ('nt', 'ce')) or
+        (isinstance(err, ssl.SSLError) and err.args[0] == 'timed out') or
+        isinstance(err, socket.timeout)
     )
 
 
 class EventletConnection(Connection):
     """
     An implementation of :class:`.Connection` that utilizes ``eventlet``.
+
+    This implementation assumes all eventlet monkey patching is active. It is not tested with partial patching.
     """
 
-    _total_reqd_bytes = 0
     _read_watcher = None
     _write_watcher = None
-    _socket = None
+
+    _socket_impl = eventlet.green.socket
+    _ssl_impl = eventlet.green.ssl
+
+    _timers = None
+    _timeout_watcher = None
+    _new_timer = None
 
     @classmethod
     def initialize_reactor(cls):
         eventlet.monkey_patch()
+        if not cls._timers:
+            cls._timers = TimerManager()
+            cls._timeout_watcher = eventlet.spawn(cls.service_timeouts)
+            cls._new_timer = Event()
 
     @classmethod
-    def factory(cls, *args, **kwargs):
-        timeout = kwargs.pop('timeout', 5.0)
-        conn = cls(*args, **kwargs)
-        conn.connected_event.wait(timeout)
-        if conn.last_error:
-            raise conn.last_error
-        elif not conn.connected_event.is_set():
-            conn.close()
-            raise OperationTimedOut("Timed out creating connection")
-        else:
-            return conn
+    def create_timer(cls, timeout, callback):
+        timer = Timer(timeout, callback)
+        cls._timers.add_timer(timer)
+        cls._new_timer.set()
+        return timer
+
+    @classmethod
+    def service_timeouts(cls):
+        """
+        cls._timeout_watcher runs in this loop forever.
+        It is usually waiting for the next timeout on the cls._new_timer Event.
+        When new timers are added, that event is set so that the watcher can
+        wake up and possibly set an earlier timeout.
+        """
+        timer_manager = cls._timers
+        while True:
+            next_end = timer_manager.service_timeouts()
+            sleep_time = max(next_end - time.time(), 0) if next_end else 10000
+            cls._new_timer.wait(sleep_time)
+            cls._new_timer.clear()
 
     def __init__(self, *args, **kwargs):
         Connection.__init__(self, *args, **kwargs)
 
-        self.connected_event = Event()
         self._write_queue = Queue()
 
-        self._callbacks = {}
-        self._push_watchers = defaultdict(set)
-
-        sockerr = None
-        addresses = socket.getaddrinfo(
-            self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM
-        )
-        for (af, socktype, proto, canonname, sockaddr) in addresses:
-            try:
-                self._socket = socket.socket(af, socktype, proto)
-                self._socket.settimeout(1.0)
-                self._socket.connect(sockaddr)
-                sockerr = None
-                break
-            except socket.error as err:
-                sockerr = err
-        if sockerr:
-            raise socket.error(
-                sockerr.errno,
-                "Tried connecting to %s. Last error: %s" % (
-                    [a[4] for a in addresses], sockerr.strerror)
-            )
-
-        if self.sockopts:
-            for args in self.sockopts:
-                self._socket.setsockopt(*args)
+        self._connect_socket()
 
         self._read_watcher = eventlet.spawn(lambda: self.handle_read())
         self._write_watcher = eventlet.spawn(lambda: self.handle_write())
@@ -126,7 +120,7 @@ class EventletConnection(Connection):
         log.debug("Closed socket to %s" % (self.host,))
 
         if not self.is_defunct:
-            self.error_all_callbacks(
+            self.error_all_requests(
                 ConnectionShutdown("Connection to %s was closed" % self.host))
             # don't leave in-progress operations hanging
             self.connected_event.set()
@@ -146,26 +140,17 @@ class EventletConnection(Connection):
                 return  # Leave the write loop
 
     def handle_read(self):
-        run_select = partial(select.select, (self._socket,), (), ())
         while True:
-            try:
-                run_select()
-            except Exception as exc:
-                if not self.is_closed:
-                    log.debug("Exception during read select() for %s: %s",
-                              self, exc)
-                    self.defunct(exc)
-                return
-
             try:
                 buf = self._socket.recv(self.in_buffer_size)
                 self._iobuf.write(buf)
             except socket.error as err:
-                if not is_timeout(err):
-                    log.debug("Exception during socket recv for %s: %s",
-                              self, err)
-                    self.defunct(err)
-                    return  # leave the read loop
+                if is_timeout(err):
+                    continue
+                log.debug("Exception during socket recv for %s: %s",
+                          self, err)
+                self.defunct(err)
+                return  # leave the read loop
 
             if self._iobuf.tell():
                 self.process_io_buffer()
@@ -178,16 +163,3 @@ class EventletConnection(Connection):
         chunk_size = self.out_buffer_size
         for i in xrange(0, len(data), chunk_size):
             self._write_queue.put(data[i:i + chunk_size])
-
-    def register_watcher(self, event_type, callback, register_timeout=None):
-        self._push_watchers[event_type].add(callback)
-        self.wait_for_response(
-            RegisterMessage(event_list=[event_type]),
-            timeout=register_timeout)
-
-    def register_watchers(self, type_callback_dict, register_timeout=None):
-        for event_type, callback in type_callback_dict.items():
-            self._push_watchers[event_type].add(callback)
-        self.wait_for_response(
-            RegisterMessage(event_list=type_callback_dict.keys()),
-            timeout=register_timeout)

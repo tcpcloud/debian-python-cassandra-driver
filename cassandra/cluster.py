@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ This module houses the main classes you will interact with,
 from __future__ import absolute_import
 
 import atexit
-from collections import defaultdict
+from collections import defaultdict, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import logging
 from random import random
@@ -27,6 +27,7 @@ import socket
 import sys
 import time
 from threading import Lock, RLock, Thread, Event
+import warnings
 
 import six
 from six.moves import range
@@ -40,13 +41,13 @@ except ImportError:
     from cassandra.util import WeakSet  # NOQA
 
 from functools import partial, wraps
-from itertools import groupby
+from itertools import groupby, count
 
 from cassandra import (ConsistencyLevel, AuthenticationFailed,
-                       InvalidRequest, OperationTimedOut,
-                       UnsupportedOperation, Unauthorized)
+                       OperationTimedOut, UnsupportedOperation,
+                       SchemaTargetType)
 from cassandra.connection import (ConnectionException, ConnectionShutdown,
-                                  ConnectionHeartbeat)
+                                  ConnectionHeartbeat, ProtocolVersionUnsupported)
 from cassandra.cqltypes import UserType
 from cassandra.encoder import Encoder
 from cassandra.protocol import (QueryMessage, ResultMessage,
@@ -59,17 +60,19 @@ from cassandra.protocol import (QueryMessage, ResultMessage,
                                 IsBootstrappingErrorMessage,
                                 BatchMessage, RESULT_KIND_PREPARED,
                                 RESULT_KIND_SET_KEYSPACE, RESULT_KIND_ROWS,
-                                RESULT_KIND_SCHEMA_CHANGE)
-from cassandra.metadata import Metadata, protect_name
-from cassandra.policies import (RoundRobinPolicy, SimpleConvictionPolicy,
+                                RESULT_KIND_SCHEMA_CHANGE, MIN_SUPPORTED_VERSION,
+                                ProtocolHandler)
+from cassandra.metadata import Metadata, protect_name, murmur3
+from cassandra.policies import (TokenAwarePolicy, DCAwareRoundRobinPolicy, SimpleConvictionPolicy,
                                 ExponentialReconnectionPolicy, HostDistance,
                                 RetryPolicy)
 from cassandra.pool import (Host, _ReconnectionHandler, _HostReconnectionHandler,
                             HostConnectionPool, HostConnection,
                             NoConnectionsAvailable)
 from cassandra.query import (SimpleStatement, PreparedStatement, BoundStatement,
-                             BatchStatement, bind_params, QueryTrace, Statement,
-                             named_tuple_factory, dict_factory, FETCH_SIZE_UNSET)
+                             BatchStatement, bind_params, QueryTrace,
+                             named_tuple_factory, dict_factory, tuple_factory, FETCH_SIZE_UNSET)
+
 
 def _is_eventlet_monkey_patched():
     if 'eventlet.patcher' not in sys.modules:
@@ -77,10 +80,17 @@ def _is_eventlet_monkey_patched():
     import eventlet.patcher
     return eventlet.patcher.is_monkey_patched('socket')
 
+
+def _is_gevent_monkey_patched():
+    if 'gevent.monkey' not in sys.modules:
+        return False
+    import gevent.socket
+    return socket.socket is gevent.socket.socket
+
 # default to gevent when we are monkey patched with gevent, eventlet when
 # monkey patched with eventlet, otherwise if libev is available, use that as
 # the default because it's fastest. Otherwise, use asyncore.
-if 'gevent.monkey' in sys.modules:
+if _is_gevent_monkey_patched():
     from cassandra.io.geventreactor import GeventConnection as DefaultConnection
 elif _is_eventlet_monkey_patched():
     from cassandra.io.eventletreactor import EventletConnection as DefaultConnection
@@ -161,6 +171,18 @@ def _shutdown_cluster(cluster):
         cluster.shutdown()
 
 
+# murmur3 implementation required for TokenAware is only available for CPython
+import platform
+if platform.python_implementation() == 'CPython':
+    def default_lbp_factory():
+        if murmur3 is not None:
+            return TokenAwarePolicy(DCAwareRoundRobinPolicy())
+        return DCAwareRoundRobinPolicy()
+else:
+    def default_lbp_factory():
+        return DCAwareRoundRobinPolicy()
+
+
 class Cluster(object):
     """
     The main class to use when interacting with a Cassandra cluster.
@@ -185,9 +207,9 @@ class Cluster(object):
     Defaults to loopback interface.
 
     Note: When using :class:`.DCAwareLoadBalancingPolicy` with no explicit
-    local_dc set, the DC is chosen from an arbitrary host in contact_points.
-    In this case, contact_points should contain only nodes from a single,
-    local DC.
+    local_dc set (as is the default), the DC is chosen from an arbitrary
+    host in contact_points. In this case, contact_points should contain
+    only nodes from a single, local DC.
     """
 
     port = 9042
@@ -202,9 +224,14 @@ class Cluster(object):
     server will be automatically used.
     """
 
-    protocol_version = 2
+    protocol_version = 4
     """
-    The version of the native protocol to use.
+    The maximum version of the native protocol to use.
+
+    The driver will automatically downgrade version based on a negotiation with
+    the server, but it is most efficient to set this to the maximum supported
+    by your version of Cassandra. Setting this will also prevent conflicting
+    versions negotiated if your cluster is upgraded.
 
     Version 2 of the native protocol adds support for lightweight transactions,
     batch operations, and automatic query paging. The v2 protocol is
@@ -214,6 +241,10 @@ class Cluster(object):
     client-side timestamps (see :attr:`.Session.use_client_timestamp`),
     serial consistency levels for :class:`~.BatchStatement`, and an
     improved connection pool.
+
+    Version 4 of the native protocol adds a number of new types, server warnings,
+    new failure messages, and custom payloads. Details in the
+    `project docs <https://github.com/apache/cassandra/blob/trunk/doc/native_protocol_v4.spec>`_
 
     The following table describes the native protocol versions that
     are supported by each version of Cassandra:
@@ -226,6 +257,8 @@ class Cluster(object):
     | 2.0               | 1, 2              |
     +-------------------+-------------------+
     | 2.1               | 1, 2, 3           |
+    +-------------------+-------------------+
+    | 2.2               | 1, 2, 3, 4        |
     +-------------------+-------------------+
     """
 
@@ -281,7 +314,16 @@ class Cluster(object):
     load_balancing_policy = None
     """
     An instance of :class:`.policies.LoadBalancingPolicy` or
-    one of its subclasses.  Defaults to :class:`~.RoundRobinPolicy`.
+    one of its subclasses.
+
+    .. versionchanged:: 2.6.0
+
+    Defaults to :class:`~.TokenAwarePolicy` (:class:`~.DCAwareRoundRobinPolicy`).
+    when using CPython (where the murmur3 extension is available). :class:`~.DCAwareRoundRobinPolicy`
+    otherwise. Default local DC will be chosen from contact points.
+
+    **Please see** :class:`~.DCAwareRoundRobinPolicy` **for a discussion on default behavior with respect to
+    DC locality and remote nodes.**
     """
 
     reconnection_policy = ExponentialReconnectionPolicy(1.0, 600.0)
@@ -310,6 +352,8 @@ class Cluster(object):
     If left as :const:`True`, hosts that are considered :attr:`~.HostDistance.REMOTE`
     by the :attr:`~.Cluster.load_balancing_policy` will have a connection
     opened to them.  Otherwise, they will not have a connection opened to them.
+
+    Note that the default load balancing policy ignores remote hosts by default.
 
     .. versionadded:: 2.1.0
     """
@@ -342,6 +386,10 @@ class Cluster(object):
     """
     An optional list of tuples which will be used as arguments to
     ``socket.setsockopt()`` for all created sockets.
+
+    Note: some drivers find setting TCPNODELAY beneficial in the context of
+    their execution model. It was not found generally beneficial for this driver.
+    To try with your own workload, set ``sockopts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]``
     """
 
     max_schema_agreement_wait = 10
@@ -363,18 +411,17 @@ class Cluster(object):
 
     * :class:`cassandra.io.asyncorereactor.AsyncoreConnection`
     * :class:`cassandra.io.libevreactor.LibevConnection`
-    * :class:`cassandra.io.geventreactor.GeventConnection` (requires monkey-patching)
+    * :class:`cassandra.io.eventletreactor.EventletConnection` (requires monkey-patching - see doc for details)
+    * :class:`cassandra.io.geventreactor.GeventConnection` (requires monkey-patching - see doc for details)
     * :class:`cassandra.io.twistedreactor.TwistedConnection`
 
     By default, ``AsyncoreConnection`` will be used, which uses
-    the ``asyncore`` module in the Python standard library.  The
-    performance is slightly worse than with ``libev``, but it is
-    supported on a wider range of systems.
+    the ``asyncore`` module in the Python standard library.
 
     If ``libev`` is installed, ``LibevConnection`` will be used instead.
 
-    If gevent monkey-patching of the standard library is detected,
-    GeventConnection will be used automatically.
+    If ``gevent`` or ``eventlet`` monkey-patching is detected, the corresponding
+    connection class will be used automatically.
     """
 
     control_connection_timeout = 2.0
@@ -426,6 +473,14 @@ class Cluster(object):
     See :attr:`.schema_event_refresh_window` for discussion of rationale
     """
 
+    connect_timeout = 5
+    """
+    Timeout, in seconds, for creating new connections.
+
+    This timeout covers the entire connection negotiation, including TCP
+    establishment, options passing, and authentication.
+    """
+
     sessions = None
     control_connection = None
     scheduler = None
@@ -458,13 +513,14 @@ class Cluster(object):
                  ssl_options=None,
                  sockopts=None,
                  cql_version=None,
-                 protocol_version=2,
+                 protocol_version=4,
                  executor_threads=2,
                  max_schema_agreement_wait=10,
                  control_connection_timeout=2.0,
                  idle_heartbeat_interval=30,
                  schema_event_refresh_window=2,
-                 topology_event_refresh_window=10):
+                 topology_event_refresh_window=10,
+                 connect_timeout=5):
         """
         Any of the mutable Cluster attributes may be set as keyword arguments
         to the constructor.
@@ -486,7 +542,7 @@ class Cluster(object):
 
             self.load_balancing_policy = load_balancing_policy
         else:
-            self.load_balancing_policy = RoundRobinPolicy()
+            self.load_balancing_policy = default_lbp_factory()
 
         if reconnection_policy is not None:
             if isinstance(reconnection_policy, type):
@@ -517,6 +573,7 @@ class Cluster(object):
         self.idle_heartbeat_interval = idle_heartbeat_interval
         self.schema_event_refresh_window = schema_event_refresh_window
         self.topology_event_refresh_window = topology_event_refresh_window
+        self.connect_timeout = connect_timeout
 
         self._listeners = set()
         self._listener_lock = Lock()
@@ -612,6 +669,11 @@ class Cluster(object):
             print row.id, row.location.street, row.location.zipcode
 
         """
+        if self.protocol_version < 3:
+            log.warning("User Type serialization is only supported in native protocol version 3+ (%d in use). "
+                        "CQL encoding for simple statements will still work, but named tuples will "
+                        "be returned when reading type %s.%s.", self.protocol_version, keyspace, user_type)
+
         self._user_types[keyspace][user_type] = klass
         for session in self.sessions:
             session.user_type_registered(keyspace, user_type, klass)
@@ -621,6 +683,13 @@ class Cluster(object):
         return self._min_requests_per_connection[host_distance]
 
     def set_min_requests_per_connection(self, host_distance, min_requests):
+        """
+        Sets a threshold for concurrent requests per connection, below which
+        connections will be considered for disposal (down to core connections;
+        see :meth:`~Cluster.set_core_connections_per_host`).
+
+        Pertains to connection pool management in protocol versions {1,2}.
+        """
         if self.protocol_version >= 3:
             raise UnsupportedOperation(
                 "Cluster.set_min_requests_per_connection() only has an effect "
@@ -631,6 +700,13 @@ class Cluster(object):
         return self._max_requests_per_connection[host_distance]
 
     def set_max_requests_per_connection(self, host_distance, max_requests):
+        """
+        Sets a threshold for concurrent requests per connection, above which new
+        connections will be created to a host (up to max connections;
+        see :meth:`~Cluster.set_max_connections_per_host`).
+
+        Pertains to connection pool management in protocol versions {1,2}.
+        """
         if self.protocol_version >= 3:
             raise UnsupportedOperation(
                 "Cluster.set_max_requests_per_connection() only has an effect "
@@ -655,6 +731,10 @@ class Cluster(object):
         for each host with :class:`~.HostDistance` equal to `host_distance`.
         The default is 2 for :attr:`~HostDistance.LOCAL` and 1 for
         :attr:`~HostDistance.REMOTE`.
+
+        Protocol version 1 and 2 are limited in the number of concurrent
+        requests they can send per connection. The driver implements connection
+        pooling to support higher levels of concurrency.
 
         If :attr:`~.Cluster.protocol_version` is set to 3 or higher, this
         is not supported (there is always one connection per host, unless
@@ -706,25 +786,34 @@ class Cluster(object):
         Intended for internal use only.
         """
         kwargs = self._make_connection_kwargs(address, kwargs)
-        return self.connection_class.factory(address, *args, **kwargs)
+        return self.connection_class.factory(address, self.connect_timeout, *args, **kwargs)
 
     def _make_connection_factory(self, host, *args, **kwargs):
         kwargs = self._make_connection_kwargs(host.address, kwargs)
-        return partial(self.connection_class.factory, host.address, *args, **kwargs)
+        return partial(self.connection_class.factory, host.address, self.connect_timeout, *args, **kwargs)
 
     def _make_connection_kwargs(self, address, kwargs_dict):
         if self._auth_provider_callable:
-            kwargs_dict['authenticator'] = self._auth_provider_callable(address)
+            kwargs_dict.setdefault('authenticator', self._auth_provider_callable(address))
 
-        kwargs_dict['port'] = self.port
-        kwargs_dict['compression'] = self.compression
-        kwargs_dict['sockopts'] = self.sockopts
-        kwargs_dict['ssl_options'] = self.ssl_options
-        kwargs_dict['cql_version'] = self.cql_version
-        kwargs_dict['protocol_version'] = self.protocol_version
-        kwargs_dict['user_type_map'] = self._user_types
+        kwargs_dict.setdefault('port', self.port)
+        kwargs_dict.setdefault('compression', self.compression)
+        kwargs_dict.setdefault('sockopts', self.sockopts)
+        kwargs_dict.setdefault('ssl_options', self.ssl_options)
+        kwargs_dict.setdefault('cql_version', self.cql_version)
+        kwargs_dict.setdefault('protocol_version', self.protocol_version)
+        kwargs_dict.setdefault('user_type_map', self._user_types)
 
         return kwargs_dict
+
+    def protocol_downgrade(self, host_addr, previous_version):
+        new_version = previous_version - 1
+        if new_version < self.protocol_version:
+            if new_version >= MIN_SUPPORTED_VERSION:
+                log.warning("Downgrading core protocol version from %d to %d for %s", self.protocol_version, new_version, host_addr)
+                self.protocol_version = new_version
+            else:
+                raise Exception("Cannot downgrade protocol version (%d) below minimum supported version: %d" % (new_version, MIN_SUPPORTED_VERSION))
 
     def connect(self, keyspace=None):
         """
@@ -806,11 +895,14 @@ class Cluster(object):
 
     def _new_session(self):
         session = Session(self, self.metadata.all_hosts())
+        self._session_register_user_types(session)
+        self.sessions.add(session)
+        return session
+
+    def _session_register_user_types(self, session):
         for keyspace, type_map in six.iteritems(self._user_types):
             for udt_name, klass in six.iteritems(type_map):
                 session.user_type_registered(keyspace, udt_name, klass)
-        self.sessions.add(session)
-        return session
 
     def _cleanup_failed_on_up_handling(self, host):
         self.load_balancing_policy.on_down(host)
@@ -1117,9 +1209,31 @@ class Cluster(object):
             for pool in session._pools.values():
                 pool.ensure_core_connections()
 
-    def refresh_schema(self, keyspace=None, table=None, usertype=None, max_schema_agreement_wait=None):
+    @staticmethod
+    def _validate_refresh_schema(keyspace, table, usertype, function, aggregate):
+        if any((table, usertype, function, aggregate)):
+            if not keyspace:
+                raise ValueError("keyspace is required to refresh specific sub-entity {table, usertype, function, aggregate}")
+            if sum(1 for e in (table, usertype, function) if e) > 1:
+                raise ValueError("{table, usertype, function, aggregate} are mutually exclusive")
+
+    @staticmethod
+    def _target_type_from_refresh_args(keyspace, table, usertype, function, aggregate):
+        if aggregate:
+            return SchemaTargetType.AGGREGATE
+        elif function:
+            return SchemaTargetType.FUNCTION
+        elif usertype:
+            return SchemaTargetType.TYPE
+        elif table:
+            return SchemaTargetType.TABLE
+        elif keyspace:
+            return SchemaTargetType.KEYSPACE
+        return None
+
+    def refresh_schema_metadata(self, max_schema_agreement_wait=None):
         """
-        Synchronously refresh the schema metadata.
+        Synchronously refresh all schema metadata.
 
         By default, the timeout for this operation is governed by :attr:`~.Cluster.max_schema_agreement_wait`
         and :attr:`~.Cluster.control_connection_timeout`.
@@ -1130,17 +1244,69 @@ class Cluster(object):
 
         An Exception is raised if schema refresh fails for any reason.
         """
-        if not self.control_connection.refresh_schema(keyspace, table, usertype, max_schema_agreement_wait):
-            raise Exception("Schema was not refreshed. See log for details.")
+        if not self.control_connection.refresh_schema(schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("Schema metadata was not refreshed. See log for details.")
 
-    def submit_schema_refresh(self, keyspace=None, table=None, usertype=None):
+    def refresh_keyspace_metadata(self, keyspace, max_schema_agreement_wait=None):
         """
-        Schedule a refresh of the internal representation of the current
-        schema for this cluster.  If `keyspace` is specified, only that
-        keyspace will be refreshed, and likewise for `table`.
+        Synchronously refresh keyspace metadata. This applies to keyspace-level information such as replication
+        and durability settings. It does not refresh tables, types, etc. contained in the keyspace.
+
+        See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
         """
-        return self.executor.submit(
-            self.control_connection.refresh_schema, keyspace, table, usertype)
+        if not self.control_connection.refresh_schema(target_type=SchemaTargetType.KEYSPACE, keyspace=keyspace,
+                                                      schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("Keyspace metadata was not refreshed. See log for details.")
+
+    def refresh_table_metadata(self, keyspace, table, max_schema_agreement_wait=None):
+        """
+        Synchronously refresh table metadata. This applies to a table, and any triggers or indexes attached
+        to the table.
+
+        See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
+        """
+        if not self.control_connection.refresh_schema(target_type=SchemaTargetType.TABLE, keyspace=keyspace, table=table, schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("Table metadata was not refreshed. See log for details.")
+
+    def refresh_materialized_view_metadata(self, keyspace, view, max_schema_agreement_wait=None):
+        """
+        Synchronously refresh materialized view metadata.
+
+        See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
+        """
+        if not self.control_connection.refresh_schema(target_type=SchemaTargetType.TABLE, keyspace=keyspace, table=view, schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("View metadata was not refreshed. See log for details.")
+
+    def refresh_user_type_metadata(self, keyspace, user_type, max_schema_agreement_wait=None):
+        """
+        Synchronously refresh user defined type metadata.
+
+        See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
+        """
+        if not self.control_connection.refresh_schema(target_type=SchemaTargetType.TYPE, keyspace=keyspace, type=user_type, schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("User Type metadata was not refreshed. See log for details.")
+
+    def refresh_user_function_metadata(self, keyspace, function, max_schema_agreement_wait=None):
+        """
+        Synchronously refresh user defined function metadata.
+
+        ``function`` is a :class:`cassandra.UserFunctionDescriptor`.
+
+        See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
+        """
+        if not self.control_connection.refresh_schema(target_type=SchemaTargetType.FUNCTION, keyspace=keyspace, function=function, schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("User Function metadata was not refreshed. See log for details.")
+
+    def refresh_user_aggregate_metadata(self, keyspace, aggregate, max_schema_agreement_wait=None):
+        """
+        Synchronously refresh user defined aggregate metadata.
+
+        ``aggregate`` is a :class:`cassandra.UserAggregateDescriptor`.
+
+        See :meth:`~.Cluster.refresh_schema_metadata` for description of ``max_schema_agreement_wait`` behavior
+        """
+        if not self.control_connection.refresh_schema(target_type=SchemaTargetType.AGGREGATE, keyspace=keyspace, aggregate=aggregate, schema_agreement_wait=max_schema_agreement_wait):
+            raise Exception("User Aggregate metadata was not refreshed. See log for details.")
 
     def refresh_nodes(self):
         """
@@ -1255,26 +1421,36 @@ class Session(object):
     """
     A default timeout, measured in seconds, for queries executed through
     :meth:`.execute()` or :meth:`.execute_async()`.  This default may be
-    overridden with the `timeout` parameter for either of those methods
-    or the `timeout` parameter for :meth:`.ResponseFuture.result()`.
+    overridden with the `timeout` parameter for either of those methods.
 
     Setting this to :const:`None` will cause no timeouts to be set by default.
 
-    **Important**: This timeout currently has no effect on callbacks registered
-    on a :class:`~.ResponseFuture` through :meth:`.ResponseFuture.add_callback` or
-    :meth:`.ResponseFuture.add_errback`; even if a query exceeds this default
-    timeout, neither the registered callback or errback will be called.
+    Please see :meth:`.ResponseFuture.result` for details on the scope and
+    effect of this timeout.
 
     .. versionadded:: 2.0.0
     """
 
-    default_consistency_level = ConsistencyLevel.ONE
+    default_consistency_level = ConsistencyLevel.LOCAL_ONE
     """
     The default :class:`~ConsistencyLevel` for operations executed through
     this session.  This default may be overridden by setting the
     :attr:`~.Statement.consistency_level` on individual statements.
 
     .. versionadded:: 1.2.0
+
+    .. versionchanged:: 3.0.0
+
+        default changed from ONE to LOCAL_ONE
+    """
+
+    default_serial_consistency_level = None
+    """
+    The default :class:`~ConsistencyLevel` for serial phase of  conditional updates executed through
+    this session.  This default may be overridden by setting the
+    :attr:`~.Statement.serial_consistency_level` on individual statements.
+
+    Only valid for ``protocol_version >= 2``.
     """
 
     max_trace_wait = 2.0
@@ -1336,11 +1512,21 @@ class Session(object):
     .. versionadded:: 2.1.0
     """
 
+    client_protocol_handler = ProtocolHandler
+    """
+    Specifies a protocol handler that will be used for client-initiated requests (i.e. no
+    internal driver requests). This can be used to override or extend features such as
+    message or type ser/des.
+
+    The default pure python implementation is :class:`cassandra.protocol.ProtocolHandler`.
+
+    When compiled with Cython, there are also built-in faster alternatives. See :ref:`faster_deser`
+    """
+
     _lock = None
     _pools = None
     _load_balancer = None
     _metrics = None
-    _protocol_version = None
 
     def __init__(self, cluster, hosts):
         self.cluster = cluster
@@ -1364,7 +1550,7 @@ class Session(object):
         for future in futures:
             future.result()
 
-    def execute(self, query, parameters=None, timeout=_NOT_SET, trace=False):
+    def execute(self, query, parameters=None, timeout=_NOT_SET, trace=False, custom_payload=None):
         """
         Execute the given query and synchronously wait for the response.
 
@@ -1382,37 +1568,19 @@ class Session(object):
         which an :exc:`.OperationTimedOut` exception will be raised if the query
         has not completed.  If not set, the timeout defaults to
         :attr:`~.Session.default_timeout`.  If set to :const:`None`, there is
-        no timeout.
+        no timeout. Please see :meth:`.ResponseFuture.result` for details on
+        the scope and effect of this timeout.
 
-        If `trace` is set to :const:`True`, an attempt will be made to
-        fetch the trace details and attach them to the `query`'s
-        :attr:`~.Statement.trace` attribute in the form of a :class:`.QueryTrace`
-        instance.  This requires that `query` be a :class:`.Statement` subclass
-        instance and not just a string.  If there is an error fetching the
-        trace details, the :attr:`~.Statement.trace` attribute will be left as
-        :const:`None`.
+        If `trace` is set to :const:`True`, the query will be sent with tracing enabled.
+        The trace details can be obtained using the returned :class:`.ResultSet` object.
+
+        `custom_payload` is a :ref:`custom_payload` dict to be passed to the server.
+        If `query` is a Statement with its own custom_payload. The message payload
+        will be a union of the two, with the values specified here taking precedence.
         """
-        if timeout is _NOT_SET:
-            timeout = self.default_timeout
+        return self.execute_async(query, parameters, trace, custom_payload, timeout).result()
 
-        if trace and not isinstance(query, Statement):
-            raise TypeError(
-                "The query argument must be an instance of a subclass of "
-                "cassandra.query.Statement when trace=True")
-
-        future = self.execute_async(query, parameters, trace)
-        try:
-            result = future.result(timeout)
-        finally:
-            if trace:
-                try:
-                    query.trace = future.get_query_trace(self.max_trace_wait)
-                except Exception:
-                    log.exception("Unable to fetch query trace:")
-
-        return result
-
-    def execute_async(self, query, parameters=None, trace=False):
+    def execute_async(self, query, parameters=None, trace=False, custom_payload=None, timeout=_NOT_SET):
         """
         Execute the given query and return a :class:`~.ResponseFuture` object
         which callbacks may be attached to for asynchronous response
@@ -1420,9 +1588,17 @@ class Session(object):
         on the :class:`.ResponseFuture` to syncronously block for results at
         any time.
 
-        If `trace` is set to :const:`True`, you may call
-        :meth:`.ResponseFuture.get_query_trace()` after the request
-        completes to retrieve a :class:`.QueryTrace` instance.
+        If `trace` is set to :const:`True`, you may get the query trace descriptors using
+        :meth:`.ResponseFuture.get_query_trace()` or :meth:`.ResponseFuture.get_all_query_traces()`
+        on the future result.
+
+        `custom_payload` is a :ref:`custom_payload` dict to be passed to the server.
+        If `query` is a Statement with its own custom_payload. The message payload
+        will be a union of the two, with the values specified here taking precedence.
+
+        If the server sends a custom payload in the response message,
+        the dict can be obtained following :meth:`.ResponseFuture.result` via
+        :attr:`.ResponseFuture.custom_payload`
 
         Example usage::
 
@@ -1449,11 +1625,15 @@ class Session(object):
             ...     log.exception("Operation failed:")
 
         """
-        future = self._create_response_future(query, parameters, trace)
+        if timeout is _NOT_SET:
+            timeout = self.default_timeout
+
+        future = self._create_response_future(query, parameters, trace, custom_payload, timeout)
+        future._protocol_handler = self.client_protocol_handler
         future.send_request()
         return future
 
-    def _create_response_future(self, query, parameters, trace):
+    def _create_response_future(self, query, parameters, trace, custom_payload, timeout):
         """ Returns the ResponseFuture before calling send_request() on it """
 
         prepared_statement = None
@@ -1464,6 +1644,8 @@ class Session(object):
             query = query.bind(parameters)
 
         cl = query.consistency_level if query.consistency_level is not None else self.default_consistency_level
+        serial_cl = query.serial_consistency_level if query.serial_consistency_level is not None else self.default_serial_consistency_level
+
         fetch_size = query.fetch_size
         if fetch_size is FETCH_SIZE_UNSET and self._protocol_version >= 2:
             fetch_size = self.default_fetch_size
@@ -1477,17 +1659,15 @@ class Session(object):
 
         if isinstance(query, SimpleStatement):
             query_string = query.query_string
-            if six.PY2 and isinstance(query_string, six.text_type):
-                query_string = query_string.encode('utf-8')
             if parameters:
                 query_string = bind_params(query_string, parameters, self.encoder)
             message = QueryMessage(
-                query_string, cl, query.serial_consistency_level,
+                query_string, cl, serial_cl,
                 fetch_size, timestamp=timestamp)
         elif isinstance(query, BoundStatement):
             message = ExecuteMessage(
                 query.prepared_statement.query_id, query.values, cl,
-                query.serial_consistency_level, fetch_size,
+                serial_cl, fetch_size,
                 timestamp=timestamp)
             prepared_statement = query.prepared_statement
         elif isinstance(query, BatchStatement):
@@ -1498,18 +1678,20 @@ class Session(object):
                     "setting Cluster.protocol_version to 2 to support this operation.")
             message = BatchMessage(
                 query.batch_type, query._statements_and_parameters, cl,
-                query.serial_consistency_level, timestamp)
+                serial_cl, timestamp)
 
-        if trace:
-            message.tracing = True
+        message.tracing = trace
+
+        message.update_custom_payload(query.custom_payload)
+        message.update_custom_payload(custom_payload)
 
         return ResponseFuture(
-            self, message, query, self.default_timeout, metrics=self._metrics,
+            self, message, query, timeout, metrics=self._metrics,
             prepared_statement=prepared_statement)
 
-    def prepare(self, query):
+    def prepare(self, query, custom_payload=None):
         """
-        Prepares a query string, returing a :class:`~cassandra.query.PreparedStatement`
+        Prepares a query string, returning a :class:`~cassandra.query.PreparedStatement`
         instance which can be used as follows::
 
             >>> session = cluster.connect("mykeyspace")
@@ -1532,19 +1714,23 @@ class Session(object):
 
         **Important**: PreparedStatements should be prepared only once.
         Preparing the same query more than once will likely affect performance.
+
+        `custom_payload` is a key value map to be passed along with the prepare
+        message. See :ref:`custom_payload`.
         """
         message = PrepareMessage(query=query)
-        future = ResponseFuture(self, message, query=None)
+        future = ResponseFuture(self, message, query=None, timeout=self.default_timeout)
         try:
             future.send_request()
-            query_id, column_metadata = future.result(self.default_timeout)
+            query_id, column_metadata, pk_indexes = future.result()
         except Exception:
             log.exception("Error preparing query:")
             raise
 
         prepared_statement = PreparedStatement.from_message(
-            query_id, column_metadata, self.cluster.metadata, query, self.keyspace,
+            query_id, column_metadata, pk_indexes, self.cluster.metadata, query, self.keyspace,
             self._protocol_version)
+        prepared_statement.custom_payload = future.custom_payload
 
         host = future._current_host
         try:
@@ -1562,7 +1748,7 @@ class Session(object):
         futures = []
         for host in self._pools.keys():
             if host != excluded_host and host.is_up:
-                future = ResponseFuture(self, PrepareMessage(query=query), None)
+                future = ResponseFuture(self, PrepareMessage(query=query), None, self.default_timeout)
 
                 # we don't care about errors preparing against specific hosts,
                 # since we can always prepare them as needed when the prepared
@@ -1583,7 +1769,7 @@ class Session(object):
 
         for host, future in futures:
             try:
-                future.result(self.default_timeout)
+                future.result()
             except Exception:
                 log.exception("Error preparing query for host %s:", host)
 
@@ -1737,11 +1923,17 @@ class Session(object):
             raise UserTypeDoesNotExist(
                 'User type %s does not exist in keyspace %s' % (user_type, keyspace))
 
+        field_names = type_meta.field_names
+        if six.PY2:
+            # go from unicode to string to avoid decode errors from implicit
+            # decode when formatting non-ascii values
+            field_names = [fn.encode('utf-8') for fn in field_names]
+
         def encode(val):
             return '{ %s }' % ' , '.join('%s : %s' % (
                 field_name,
                 self.encoder.cql_encode_all_types(getattr(val, field_name, None))
-            ) for field_name in type_meta.field_names)
+            ) for field_name in field_names)
 
         self.encoder.mapping[klass] = encode
 
@@ -1776,7 +1968,6 @@ class _ControlReconnectionHandler(_ReconnectionHandler):
         self.control_connection = weakref.proxy(control_connection)
 
     def try_reconnect(self):
-        # we'll either get back a new Connection or a NoHostAvailable
         return self.control_connection._reconnect_internal()
 
     def on_reconnection(self, connection):
@@ -1818,14 +2009,8 @@ class ControlConnection(object):
     Internal
     """
 
-    _SELECT_KEYSPACES = "SELECT * FROM system.schema_keyspaces"
-    _SELECT_COLUMN_FAMILIES = "SELECT * FROM system.schema_columnfamilies"
-    _SELECT_COLUMNS = "SELECT * FROM system.schema_columns"
-    _SELECT_USERTYPES = "SELECT * FROM system.schema_usertypes"
-    _SELECT_TRIGGERS = "SELECT * FROM system.schema_triggers"
-
     _SELECT_PEERS = "SELECT peer, data_center, rack, tokens, rpc_address, schema_version FROM system.peers"
-    _SELECT_LOCAL = "SELECT cluster_name, data_center, rack, tokens, partitioner, schema_version FROM system.local WHERE key='local'"
+    _SELECT_LOCAL = "SELECT cluster_name, data_center, rack, tokens, partitioner, release_version, schema_version FROM system.local WHERE key='local'"
 
     _SELECT_SCHEMA_PEERS = "SELECT peer, rpc_address, schema_version FROM system.peers"
     _SELECT_SCHEMA_LOCAL = "SELECT schema_version FROM system.local WHERE key='local'"
@@ -1859,6 +2044,8 @@ class ControlConnection(object):
 
         self._reconnection_handler = None
         self._reconnection_lock = RLock()
+
+        self._event_schedule_times = {}
 
     def connect(self):
         if self._is_shutdown:
@@ -1908,7 +2095,13 @@ class ControlConnection(object):
         node/token and schema metadata.
         """
         log.debug("[control connection] Opening new connection to %s", host)
-        connection = self._cluster.connection_factory(host.address, is_control_connection=True)
+
+        while True:
+            try:
+                connection = self._cluster.connection_factory(host.address, is_control_connection=True)
+                break
+            except ProtocolVersionUnsupported as e:
+                self._cluster.protocol_downgrade(host.address, e.startup_version)
 
         log.debug("[control connection] Established new connection %r, "
                   "registering watchers and refreshing schema and topology",
@@ -1932,10 +2125,7 @@ class ControlConnection(object):
                 peers_query, local_query, timeout=self._timeout)
 
             self._refresh_node_list_and_token_map(connection, preloaded_results=shared_results)
-            self._refresh_schema(connection, preloaded_results=shared_results)
-            if not self._cluster.metadata.keyspaces:
-                log.warning("[control connection] No schema built on connect; retrying without wait for schema agreement")
-                self._refresh_schema(connection, preloaded_results=shared_results, schema_agreement_wait=0)
+            self._refresh_schema(connection, preloaded_results=shared_results, schema_agreement_wait=-1)
         except Exception:
             connection.close()
             raise
@@ -1994,31 +2184,30 @@ class ControlConnection(object):
         return None
 
     def shutdown(self):
+        # stop trying to reconnect (if we are)
+        with self._reconnection_lock:
+            if self._reconnection_handler:
+                self._reconnection_handler.cancel()
+
         with self._lock:
             if self._is_shutdown:
                 return
             else:
                 self._is_shutdown = True
 
-        log.debug("Shutting down control connection")
-        # stop trying to reconnect (if we are)
-        if self._reconnection_handler:
-            self._reconnection_handler.cancel()
+            log.debug("Shutting down control connection")
+            if self._connection:
+                self._connection.close()
+                del self._connection
 
-        if self._connection:
-            self._connection.close()
-            del self._connection
-
-    def refresh_schema(self, keyspace=None, table=None, usertype=None,
-                       schema_agreement_wait=None):
+    def refresh_schema(self, **kwargs):
         if not self._meta_refresh_enabled:
             log.debug("[control connection] Skipping schema refresh because meta refresh is disabled")
             return False
 
         try:
             if self._connection:
-                return self._refresh_schema(self._connection, keyspace, table, usertype,
-                                            schema_agreement_wait=schema_agreement_wait)
+                return self._refresh_schema(self._connection, **kwargs)
         except ReferenceError:
             pass  # our weak reference to the Cluster is no good
         except Exception:
@@ -2026,12 +2215,9 @@ class ControlConnection(object):
             self._signal_error()
         return False
 
-    def _refresh_schema(self, connection, keyspace=None, table=None, usertype=None,
-                        preloaded_results=None, schema_agreement_wait=None):
+    def _refresh_schema(self, connection, preloaded_results=None, schema_agreement_wait=None, **kwargs):
         if self._cluster.is_shutdown:
             return False
-
-        assert table is None or usertype is None
 
         agreed = self.wait_for_schema_agreement(connection,
                                                 preloaded_results=preloaded_results,
@@ -2040,105 +2226,8 @@ class ControlConnection(object):
             log.debug("Skipping schema refresh due to lack of schema agreement")
             return False
 
-        cl = ConsistencyLevel.ONE
-        if table:
-            def _handle_results(success, result):
-                if success:
-                    return dict_factory(*result.results) if result else {}
-                else:
-                    raise result
+        self._cluster.metadata.refresh(connection, self._timeout, **kwargs)
 
-            # a particular table changed
-            where_clause = " WHERE keyspace_name = '%s' AND columnfamily_name = '%s'" % (keyspace, table)
-            cf_query = QueryMessage(query=self._SELECT_COLUMN_FAMILIES + where_clause, consistency_level=cl)
-            col_query = QueryMessage(query=self._SELECT_COLUMNS + where_clause, consistency_level=cl)
-            triggers_query = QueryMessage(query=self._SELECT_TRIGGERS + where_clause, consistency_level=cl)
-            (cf_success, cf_result), (col_success, col_result), (triggers_success, triggers_result) \
-                = connection.wait_for_responses(cf_query, col_query, triggers_query, timeout=self._timeout, fail_on_error=False)
-
-            log.debug("[control connection] Fetched table info for %s.%s, rebuilding metadata", keyspace, table)
-            cf_result = _handle_results(cf_success, cf_result)
-            col_result = _handle_results(col_success, col_result)
-
-            # handle the triggers table not existing in Cassandra 1.2
-            if not triggers_success and isinstance(triggers_result, InvalidRequest):
-                triggers_result = {}
-            else:
-                triggers_result = _handle_results(triggers_success, triggers_result)
-
-            self._cluster.metadata.table_changed(keyspace, table, cf_result, col_result, triggers_result)
-        elif usertype:
-            # user defined types within this keyspace changed
-            where_clause = " WHERE keyspace_name = '%s' AND type_name = '%s'" % (keyspace, usertype)
-            types_query = QueryMessage(query=self._SELECT_USERTYPES + where_clause, consistency_level=cl)
-            types_result = connection.wait_for_response(types_query)
-            log.debug("[control connection] Fetched user type info for %s.%s, rebuilding metadata", keyspace, usertype)
-            types_result = dict_factory(*types_result.results) if types_result.results else {}
-            self._cluster.metadata.usertype_changed(keyspace, usertype, types_result)
-        elif keyspace:
-            # only the keyspace itself changed (such as replication settings)
-            where_clause = " WHERE keyspace_name = '%s'" % (keyspace,)
-            ks_query = QueryMessage(query=self._SELECT_KEYSPACES + where_clause, consistency_level=cl)
-            ks_result = connection.wait_for_response(ks_query)
-            log.debug("[control connection] Fetched keyspace info for %s, rebuilding metadata", keyspace)
-            ks_result = dict_factory(*ks_result.results) if ks_result.results else {}
-            self._cluster.metadata.keyspace_changed(keyspace, ks_result)
-        else:
-            # build everything from scratch
-            queries = [
-                QueryMessage(query=self._SELECT_KEYSPACES, consistency_level=cl),
-                QueryMessage(query=self._SELECT_COLUMN_FAMILIES, consistency_level=cl),
-                QueryMessage(query=self._SELECT_COLUMNS, consistency_level=cl),
-                QueryMessage(query=self._SELECT_USERTYPES, consistency_level=cl),
-                QueryMessage(query=self._SELECT_TRIGGERS, consistency_level=cl)
-            ]
-
-            responses = connection.wait_for_responses(*queries, timeout=self._timeout, fail_on_error=False)
-            (ks_success, ks_result), (cf_success, cf_result), \
-                (col_success, col_result), (types_success, types_result), \
-                (trigger_success, triggers_result) = responses
-
-            if ks_success:
-                ks_result = dict_factory(*ks_result.results)
-            else:
-                raise ks_result
-
-            if cf_success:
-                cf_result = dict_factory(*cf_result.results)
-            else:
-                raise cf_result
-
-            if col_success:
-                col_result = dict_factory(*col_result.results)
-            else:
-                raise col_result
-
-            # if we're connected to Cassandra < 2.0, the trigges table will not exist
-            if trigger_success:
-                triggers_result = dict_factory(*triggers_result.results)
-            else:
-                if isinstance(triggers_result, InvalidRequest):
-                    log.debug("[control connection] triggers table not found")
-                    triggers_result = {}
-                elif isinstance(triggers_result, Unauthorized):
-                    log.warning("[control connection] this version of Cassandra does not allow access to schema_triggers metadata with authorization enabled (CASSANDRA-7967); "
-                                "The driver will operate normally, but will not reflect triggers in the local metadata model, or schema strings.")
-                    triggers_result = {}
-                else:
-                    raise triggers_result
-
-            # if we're connected to Cassandra < 2.1, the usertypes table will not exist
-            if types_success:
-                types_result = dict_factory(*types_result.results) if types_result.results else {}
-            else:
-                if isinstance(types_result, InvalidRequest):
-                    log.debug("[control connection] user types table not found")
-                    types_result = {}
-                else:
-                    raise types_result
-
-            log.debug("[control connection] Fetched schema, rebuilding metadata")
-            self._cluster.metadata.rebuild_schema(ks_result, types_result, cf_result, col_result, triggers_result)
         return True
 
     def refresh_node_list_and_token_map(self, force_token_rebuild=False):
@@ -2193,6 +2282,8 @@ class ControlConnection(object):
             tokens = local_row.get("tokens")
             if partitioner and tokens:
                 token_map[host] = tokens
+
+            connection.server_version = local_row['release_version']
 
         # Check metadata.partitioner to see if we haven't built anything yet. If
         # every node in the cluster was in the contact points, we won't discover
@@ -2249,12 +2340,26 @@ class ControlConnection(object):
         self._cluster.load_balancing_policy.on_up(host)
         return True
 
+    def _delay_for_event_type(self, event_type, delay_window):
+        # this serves to order processing correlated events (received within the window)
+        # the window and randomization still have the desired effect of skew across client instances
+        next_time = self._event_schedule_times.get(event_type, 0)
+        now = self._time.time()
+        if now <= next_time:
+            this_time = next_time + 0.01
+            delay = this_time - now
+        else:
+            delay = random() * delay_window
+            this_time = now + delay
+        self._event_schedule_times[event_type] = this_time
+        return delay
+
     def _handle_topology_change(self, event):
         change_type = event["change_type"]
         addr, port = event["address"]
         if change_type == "NEW_NODE" or change_type == "MOVED_NODE":
             if self._topology_event_refresh_window >= 0:
-                delay = random() * self._topology_event_refresh_window
+                delay = self._delay_for_event_type('topology_change', self._topology_event_refresh_window)
                 self._cluster.scheduler.schedule_unique(delay, self.refresh_node_list_and_token_map)
         elif change_type == "REMOVED_NODE":
             host = self._cluster.metadata.get_host(addr)
@@ -2265,7 +2370,7 @@ class ControlConnection(object):
         addr, port = event["address"]
         host = self._cluster.metadata.get_host(addr)
         if change_type == "UP":
-            delay = 1 + random() * 0.5  # randomness to avoid thundering herd problem on events
+            delay = 1 + self._delay_for_event_type('status_change', 0.5)  # randomness to avoid thundering herd problem on events
             if host is None:
                 # this is the first time we've seen the node
                 self._cluster.scheduler.schedule_unique(delay, self.refresh_node_list_and_token_map)
@@ -2283,12 +2388,8 @@ class ControlConnection(object):
     def _handle_schema_change(self, event):
         if self._schema_event_refresh_window < 0:
             return
-
-        keyspace = event.get('keyspace')
-        table = event.get('table')
-        usertype = event.get('type')
-        delay = random() * self._schema_event_refresh_window
-        self._cluster.scheduler.schedule_unique(delay, self.refresh_schema, keyspace, table, usertype)
+        delay = self._delay_for_event_type('schema_change', self._schema_event_refresh_window)
+        self._cluster.scheduler.schedule_unique(delay, self.refresh_schema, **event)
 
     def wait_for_schema_agreement(self, connection=None, preloaded_results=None, wait_time=None):
 
@@ -2381,16 +2482,20 @@ class ControlConnection(object):
         return dict((version, list(nodes)) for version, nodes in six.iteritems(versions))
 
     def _signal_error(self):
-        # try just signaling the cluster, as this will trigger a reconnect
-        # as part of marking the host down
-        if self._connection and self._connection.is_defunct:
-            host = self._cluster.metadata.get_host(self._connection.host)
-            # host may be None if it's already been removed, but that indicates
-            # that errors have already been reported, so we're fine
-            if host:
-                self._cluster.signal_connection_failure(
-                    host, self._connection.last_error, is_host_addition=False)
+        with self._lock:
+            if self._is_shutdown:
                 return
+
+            # try just signaling the cluster, as this will trigger a reconnect
+            # as part of marking the host down
+            if self._connection and self._connection.is_defunct:
+                host = self._cluster.metadata.get_host(self._connection.host)
+                # host may be None if it's already been removed, but that indicates
+                # that errors have already been reported, so we're fine
+                if host:
+                    self._cluster.signal_connection_failure(
+                        host, self._connection.last_error, is_host_addition=False)
+                    return
 
         # if the connection is not defunct or the host already left, reconnect
         # manually
@@ -2448,6 +2553,7 @@ class _Scheduler(object):
     def __init__(self, executor):
         self._queue = Queue.PriorityQueue()
         self._scheduled_tasks = set()
+        self._count = count()
         self._executor = executor
 
         t = Thread(target=self.run, name="Task Scheduler")
@@ -2465,13 +2571,13 @@ class _Scheduler(object):
             # this can happen on interpreter shutdown
             pass
         self.is_shutdown = True
-        self._queue.put_nowait((0, None))
+        self._queue.put_nowait((0, 0, None))
 
-    def schedule(self, delay, fn, *args):
-        self._insert_task(delay, (fn, args))
+    def schedule(self, delay, fn, *args, **kwargs):
+        self._insert_task(delay, (fn, args, tuple(kwargs.items())))
 
-    def schedule_unique(self, delay, fn, *args):
-        task = (fn, args)
+    def schedule_unique(self, delay, fn, *args, **kwargs):
+        task = (fn, args, tuple(kwargs.items()))
         if task not in self._scheduled_tasks:
             self._insert_task(delay, task)
         else:
@@ -2481,7 +2587,7 @@ class _Scheduler(object):
         if not self.is_shutdown:
             run_at = time.time() + delay
             self._scheduled_tasks.add(task)
-            self._queue.put_nowait((run_at, task))
+            self._queue.put_nowait((run_at, next(self._count), task))
         else:
             log.debug("Ignoring scheduled task after shutdown: %r", task)
 
@@ -2492,17 +2598,18 @@ class _Scheduler(object):
 
             try:
                 while True:
-                    run_at, task = self._queue.get(block=True, timeout=None)
+                    run_at, i, task = self._queue.get(block=True, timeout=None)
                     if self.is_shutdown:
                         log.debug("Not executing scheduled task due to Scheduler shutdown")
                         return
                     if run_at <= time.time():
-                        self._scheduled_tasks.remove(task)
-                        fn, args = task
-                        future = self._executor.submit(fn, *args)
+                        self._scheduled_tasks.discard(task)
+                        fn, args, kwargs = task
+                        kwargs = dict(kwargs)
+                        future = self._executor.submit(fn, *args, **kwargs)
                         future.add_done_callback(self._log_if_failed)
                     else:
-                        self._queue.put_nowait((run_at, task))
+                        self._queue.put_nowait((run_at, i, task))
                         break
             except Queue.Empty:
                 pass
@@ -2517,19 +2624,18 @@ class _Scheduler(object):
                 exc_info=exc)
 
 
-def refresh_schema_and_set_result(keyspace, table, usertype, control_conn, response_future):
+def refresh_schema_and_set_result(control_conn, response_future, **kwargs):
     try:
         if control_conn._meta_refresh_enabled:
-            log.debug("Refreshing schema in response to schema change. Keyspace: %s; Table: %s, Type: %s",
-                      keyspace, table, usertype)
-            control_conn._refresh_schema(response_future._connection, keyspace, table, usertype)
+            log.debug("Refreshing schema in response to schema change. "
+                      "%s", kwargs)
+            response_future.is_schema_agreed = control_conn._refresh_schema(response_future._connection, **kwargs)
         else:
             log.debug("Skipping schema refresh in response to schema change because meta refresh is disabled; "
-                      "Keyspace: %s; Table: %s, Type: %s", keyspace, table, usertype)
+                      "%s", kwargs)
     except Exception:
         log.exception("Exception refreshing schema in response to schema change:")
-        response_future.session.submit(
-            control_conn.refresh_schema, keyspace, table, usertype)
+        response_future.session.submit(control_conn.refresh_schema, **kwargs)
     finally:
         response_future._set_final_result(None)
 
@@ -2552,6 +2658,13 @@ class ResponseFuture(object):
     :class:`.ResponseFuture`.
     """
 
+    is_schema_agreed = True
+    """
+    For DDL requests, this may be set ``False`` if the schema agreement poll after the response fails.
+
+    Always ``True`` for non-DDL requests.
+    """
+
     session = None
     row_factory = None
     message = None
@@ -2559,8 +2672,9 @@ class ResponseFuture(object):
 
     _req_id = None
     _final_result = _NOT_SET
+    _col_names = None
     _final_exception = None
-    _query_trace = None
+    _query_traces = None
     _callbacks = None
     _errbacks = None
     _current_host = None
@@ -2570,13 +2684,19 @@ class ResponseFuture(object):
     _start_time = None
     _metrics = None
     _paging_state = None
+    _custom_payload = None
+    _warnings = None
+    _timer = None
+    _protocol_handler = ProtocolHandler
 
-    def __init__(self, session, message, query, default_timeout=None, metrics=None, prepared_statement=None):
+    _warned_timeout = False
+
+    def __init__(self, session, message, query, timeout, metrics=None, prepared_statement=None):
         self.session = session
         self.row_factory = session.row_factory
         self.message = message
         self.query = query
-        self.default_timeout = default_timeout
+        self.timeout = timeout
         self._metrics = metrics
         self.prepared_statement = prepared_statement
         self._callback_lock = Lock()
@@ -2587,6 +2707,17 @@ class ResponseFuture(object):
         self._errors = {}
         self._callbacks = []
         self._errbacks = []
+
+    def _start_timer(self):
+        if self.timeout is not None:
+            self._timer = self.session.cluster.connection_class.create_timer(self.timeout, self._on_timeout)
+
+    def _cancel_timer(self):
+        if self._timer:
+            self._timer.cancel()
+
+    def _on_timeout(self):
+        self._set_final_exception(OperationTimedOut(self._errors, self._current_host))
 
     def _make_query_plan(self):
         # convert the list/generator/etc to an iterator so that subsequent
@@ -2603,6 +2734,12 @@ class ResponseFuture(object):
             req_id = self._query(host)
             if req_id is not None:
                 self._req_id = req_id
+
+                # timer is only started here, after we have at least one message queued
+                # this is done to avoid overrun of timers with unfettered client requests
+                # in the case of full disconnect, where no hosts will be available
+                if self._timer is None:
+                    self._start_timer()
                 return
 
         self._set_final_exception(NoHostAvailable(
@@ -2631,7 +2768,7 @@ class ResponseFuture(object):
             # TODO get connectTimeout from cluster settings
             connection, request_id = pool.borrow_connection(timeout=2.0)
             self._connection = connection
-            connection.send_msg(message, request_id, cb=cb)
+            connection.send_msg(message, request_id, cb=cb, encoder=self._protocol_handler.encode_message, decoder=self._protocol_handler.decode_message)
             return request_id
         except NoConnectionsAvailable as exc:
             log.debug("All connections for host %s are at capacity, moving to the next host", host)
@@ -2657,6 +2794,42 @@ class ResponseFuture(object):
         """
         return self._paging_state is not None
 
+    @property
+    def warnings(self):
+        """
+        Warnings returned from the server, if any. This will only be
+        set for protocol_version 4+.
+
+        Warnings may be returned for such things as oversized batches,
+        or too many tombstones in slice queries.
+
+        Ensure the future is complete before trying to access this property
+        (call :meth:`.result()`, or after callback is invoked).
+        Otherwise it may throw if the response has not been received.
+        """
+        # TODO: When timers are introduced, just make this wait
+        if not self._event.is_set():
+            raise Exception("warnings cannot be retrieved before ResponseFuture is finalized")
+        return self._warnings
+
+    @property
+    def custom_payload(self):
+        """
+        The custom payload returned from the server, if any. This will only be
+        set by Cassandra servers implementing a custom QueryHandler, and only
+        for protocol_version 4+.
+
+        Ensure the future is complete before trying to access this property
+        (call :meth:`.result()`, or after callback is invoked).
+        Otherwise it may throw if the response has not been received.
+
+        :return: :ref:`custom_payload`.
+        """
+        # TODO: When timers are introduced, just make this wait
+        if not self._event.is_set():
+            raise Exception("custom_payload cannot be retrieved before ResponseFuture is finalized")
+        return self._custom_payload
+
     def start_fetching_next_page(self):
         """
         If there are more pages left in the query result, this asynchronously
@@ -2675,6 +2848,7 @@ class ResponseFuture(object):
         self._event.clear()
         self._final_result = _NOT_SET
         self._final_exception = None
+        self._timer = None  # clear cancelled timer; new one will be set when request is queued
         self.send_request()
 
     def _reprepare(self, prepare_message):
@@ -2691,7 +2865,12 @@ class ResponseFuture(object):
 
             trace_id = getattr(response, 'trace_id', None)
             if trace_id:
-                self._query_trace = QueryTrace(trace_id, self.session)
+                if not self._query_traces:
+                    self._query_traces = []
+                self._query_traces.append(QueryTrace(trace_id, self.session))
+
+            self._warnings = getattr(response, 'warnings', None)
+            self._custom_payload = getattr(response, 'custom_payload', None)
 
             if isinstance(response, ResultMessage):
                 if response.kind == RESULT_KIND_SET_KEYSPACE:
@@ -2709,17 +2888,16 @@ class ResponseFuture(object):
                 elif response.kind == RESULT_KIND_SCHEMA_CHANGE:
                     # refresh the schema before responding, but do it in another
                     # thread instead of the event loop thread
+                    self.is_schema_agreed = False
                     self.session.submit(
                         refresh_schema_and_set_result,
-                        response.results['keyspace'],
-                        response.results.get('table'),
-                        response.results.get('type'),
                         self.session.cluster.control_connection,
-                        self)
+                        self, **response.results)
                 else:
                     results = getattr(response, 'results', None)
                     if results is not None and response.kind == RESULT_KIND_ROWS:
                         self._paging_state = response.paging_state
+                        self._col_names = results[0]
                         results = self.row_factory(*results)
                     self._set_final_result(results)
             elif isinstance(response, ErrorMessage):
@@ -2866,7 +3044,10 @@ class ResponseFuture(object):
                     "Got unexpected response when preparing statement "
                     "on host %s: %s" % (self._current_host, response)))
         elif isinstance(response, ErrorMessage):
-            self._set_final_exception(response)
+            if hasattr(response, 'to_exception'):
+                self._set_final_exception(response.to_exception())
+            else:
+                self._set_final_exception(response)
         elif isinstance(response, ConnectionException):
             log.debug("Connection error when preparing statement on host %s: %s",
                       self._current_host, response)
@@ -2879,6 +3060,7 @@ class ResponseFuture(object):
                 "statement on host %s: %s" % (self._current_host, response)))
 
     def _set_final_result(self, response):
+        self._cancel_timer()
         if self._metrics is not None:
             self._metrics.request_timer.addValue(time.time() - self._start_time)
 
@@ -2893,6 +3075,7 @@ class ResponseFuture(object):
             fn(response, *args, **kwargs)
 
     def _set_final_exception(self, response):
+        self._cancel_timer()
         if self._metrics is not None:
             self._metrics.request_timer.addValue(time.time() - self._start_time)
 
@@ -2930,17 +3113,17 @@ class ResponseFuture(object):
         # otherwise, move onto another host
         self.send_request()
 
-    def result(self, timeout=_NOT_SET):
+    def result(self):
         """
         Return the final result or raise an Exception if errors were
         encountered.  If the final result or error has not been set
-        yet, this method will block until that time.
+        yet, this method will block until it is set, or the timeout
+        set for the request expires.
 
-        You may set a timeout (in seconds) with the `timeout` parameter.
-        By default, the :attr:`~.default_timeout` for the :class:`.Session`
-        this was created through will be used for the timeout on this
-        operation.  If the timeout is exceeded, an
-        :exc:`cassandra.OperationTimedOut` will be raised.
+        Timeout is specified in the Session request execution functions.
+        If the timeout is exceeded, an :exc:`cassandra.OperationTimedOut` will be raised.
+        This is a client-side timeout. For more information
+        about server-side coordinator timeouts, see :class:`.policies.RetryPolicy`.
 
         Example usage::
 
@@ -2955,42 +3138,45 @@ class ResponseFuture(object):
             ...     log.exception("Operation failed:")
 
         """
-        if timeout is _NOT_SET:
-            timeout = self.default_timeout
-
+        self._event.wait()
         if self._final_result is not _NOT_SET:
-            if self._paging_state is None:
-                return self._final_result
-            else:
-                return PagedResult(self, self._final_result, timeout)
-        elif self._final_exception:
-            raise self._final_exception
+            return ResultSet(self, self._final_result)
         else:
-            self._event.wait(timeout=timeout)
-            if self._final_result is not _NOT_SET:
-                if self._paging_state is None:
-                    return self._final_result
-                else:
-                    return PagedResult(self, self._final_result, timeout)
-            elif self._final_exception:
-                raise self._final_exception
-            else:
-                raise OperationTimedOut(errors=self._errors, last_host=self._current_host)
+            raise self._final_exception
+
+    def get_query_trace_ids(self):
+        """
+        Returns the trace session ids for this future, if tracing was enabled (does not fetch trace data).
+        """
+        return [trace.trace_id for trace in self._query_traces]
 
     def get_query_trace(self, max_wait=None):
         """
-        Returns the :class:`~.query.QueryTrace` instance representing a trace
-        of the last attempt for this operation, or :const:`None` if tracing was
-        not enabled for this query.  Note that this may raise an exception if
-        there are problems retrieving the trace details from Cassandra. If the
-        trace is not available after `max_wait` seconds,
+        Fetches and returns the query trace of the last response, or `None` if tracing was
+        not enabled.
+
+        Note that this may raise an exception if there are problems retrieving the trace
+        details from Cassandra. If the trace is not available after `max_wait_sec`,
         :exc:`cassandra.query.TraceUnavailable` will be raised.
         """
-        if not self._query_trace:
-            return None
+        if self._query_traces:
+            return self._get_query_trace(len(self._query_traces) - 1, max_wait)
 
-        self._query_trace.populate(max_wait)
-        return self._query_trace
+    def get_all_query_traces(self, max_wait_per=None):
+        """
+        Fetches and returns the query traces for all query pages, if tracing was enabled.
+
+        See note in :meth:`~.get_query_trace` regarding possible exceptions.
+        """
+        if self._query_traces:
+            return [self._get_query_trace(i, max_wait_per) for i in range(len(self._query_traces))]
+        return []
+
+    def _get_query_trace(self, i, max_wait):
+        trace = self._query_traces[i]
+        if not trace.events:
+            trace.populate(max_wait=max_wait)
+        return trace
 
     def add_callback(self, fn, *args, **kwargs):
         """
@@ -3006,6 +3192,11 @@ class ResponseFuture(object):
 
         If the final result has already been seen when this method is called,
         the callback will be called immediately (before this method returns).
+
+        Note: in the case that the result is not available when the callback is added,
+        the callback is executed by IO event thread. This means that the callback
+        should not block or attempt further synchronous requests, because no further
+        IO will be processed until the callback returns.
 
         **Important**: if the callback you attach results in an exception being
         raised, **the exception will be ignored**, so please ensure your
@@ -3101,12 +3292,13 @@ class QueryExhausted(Exception):
     pass
 
 
-class PagedResult(object):
+class ResultSet(object):
     """
-    An iterator over the rows from a paged query result.  Whenever the number
-    of result rows for a query exceed the :attr:`~.query.Statement.fetch_size`
-    (or :attr:`~.Session.default_fetch_size`, if not set) an instance of this
-    class will be returned.
+    An iterator over the rows from a query result. Also supplies basic equality
+    and indexing methods for backward-compatability. These methods materialize
+    the entire result set (loading all pages), and should only be used if the
+    total result size is understood. Warnings are emitted when paged results
+    are materialized in this fashion.
 
     You can treat this as a normal iterator over rows::
 
@@ -3119,34 +3311,133 @@ class PagedResult(object):
     be fetched transparently.  However, note that it *is* possible for
     an :class:`Exception` to be raised while fetching the next page, just
     like you might see on a normal call to ``session.execute()``.
-
-    .. versionadded: 2.0.0
     """
 
-    response_future = None
-
-    def __init__(self, response_future, initial_response, timeout=_NOT_SET):
+    def __init__(self, response_future, initial_response):
         self.response_future = response_future
-        self.current_response = iter(initial_response)
-        self.timeout = timeout
+        self.column_names = response_future._col_names
+        self._set_current_rows(initial_response)
+        self._page_iter = None
+        self._list_mode = False
+
+    @property
+    def has_more_pages(self):
+        """
+        True if the last response indicated more pages; False otherwise
+        """
+        return self.response_future.has_more_pages
+
+    @property
+    def current_rows(self):
+        """
+        The list of current page rows. May be empty if the result was empty,
+        or this is the last page.
+        """
+        return self._current_rows or []
 
     def __iter__(self):
+        if self._list_mode:
+            return iter(self._current_rows)
+        self._page_iter = iter(self._current_rows)
         return self
 
     def next(self):
         try:
-            return next(self.current_response)
+            return next(self._page_iter)
         except StopIteration:
             if not self.response_future.has_more_pages:
+                if not self._list_mode:
+                    self._current_rows = []
                 raise
 
-        self.response_future.start_fetching_next_page()
-        result = self.response_future.result(self.timeout)
-        if self.response_future.has_more_pages:
-            self.current_response = result.current_response
-        else:
-            self.current_response = iter(result)
+        self.fetch_next_page()
+        self._page_iter = iter(self._current_rows)
 
-        return next(self.current_response)
+        return next(self._page_iter)
 
     __next__ = next
+
+    def fetch_next_page(self):
+        """
+        Manually, synchronously fetch the next page. Supplied for manually retrieving pages
+        and inspecting :meth:`~.current_page`. It is not necessary to call this when iterating
+        through results; paging happens implicitly in iteration.
+        """
+        if self.response_future.has_more_pages:
+            self.response_future.start_fetching_next_page()
+            result = self.response_future.result()
+            self._current_rows = result._current_rows  # ResultSet has already _set_current_rows to the appropriate form
+        else:
+            self._current_rows = []
+
+    def _set_current_rows(self, result):
+        if isinstance(result, Mapping):
+            self._current_rows = [result] if result else []
+            return
+        try:
+            iter(result)  # can't check directly for generator types because cython generators are different
+            self._current_rows = result
+        except TypeError:
+            self._current_rows = [result] if result else []
+
+    def _fetch_all(self):
+        self._current_rows = list(self)
+        self._page_iter = None
+
+    def _enter_list_mode(self, operator):
+        if self._list_mode:
+            return
+        if self._page_iter:
+            raise RuntimeError("Cannot use %s when results have been iterated." % operator)
+        if self.response_future.has_more_pages:
+            log.warning("Using %s on paged results causes entire result set to be materialized.", operator)
+            self._fetch_all()
+        self._list_mode = True
+
+    def __eq__(self, other):
+        self._enter_list_mode("equality operator")
+        return self._current_rows == other
+
+    def __getitem__(self, i):
+        self._enter_list_mode("index operator")
+        return self._current_rows[i]
+
+    def __nonzero__(self):
+        return bool(self._current_rows)
+
+    __bool__ = __nonzero__
+
+    def get_query_trace(self, max_wait_sec=None):
+        """
+        Gets the last query trace from the associated future.
+        See :meth:`.ResponseFuture.get_query_trace` for details.
+        """
+        return self.response_future.get_query_trace(max_wait_sec)
+
+    def get_all_query_traces(self, max_wait_sec_per=None):
+        """
+        Gets all query traces from the associated future.
+        See :meth:`.ResponseFuture.get_all_query_traces` for details.
+        """
+        return self.response_future.get_all_query_traces(max_wait_sec_per)
+
+    @property
+    def was_applied(self):
+        """
+        For LWT results, returns whether the transaction was applied.
+
+        Result is indeterminate if called on a result that was not an LWT request.
+
+        Only valid when one of tne of the internal row factories is in use.
+        """
+        if self.response_future.row_factory not in (named_tuple_factory, dict_factory, tuple_factory):
+            raise RuntimeError("Cannot determine LWT result with row factory %s" % (self.response_future.row_factsory,))
+        if len(self.current_rows) != 1:
+            raise RuntimeError("LWT result should have exactly one row. This has %d." % (len(self.current_rows)))
+
+        row = self.current_rows[0]
+        if isinstance(row, tuple):
+            return row[0]
+        else:
+            return row['[applied]']
+

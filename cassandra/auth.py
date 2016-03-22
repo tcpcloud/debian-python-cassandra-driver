@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -61,6 +61,9 @@ class Authenticator(object):
 
     .. versionadded:: 2.0.0
     """
+
+    server_authenticator_class = None
+    """ Set during the connection AUTHENTICATE phase """
 
     def initial_response(self):
         """
@@ -139,8 +142,7 @@ class SaslAuthProvider(AuthProvider):
         from cassandra.cluster import Cluster
         from cassandra.auth import SaslAuthProvider
 
-        sasl_kwargs = {'host': 'localhost',
-                       'service': 'dse',
+        sasl_kwargs = {'service': 'something',
                        'mechanism': 'GSSAPI',
                        'qops': 'auth'.split(',')}
         auth_provider = SaslAuthProvider(**sasl_kwargs)
@@ -152,10 +154,13 @@ class SaslAuthProvider(AuthProvider):
     def __init__(self, **sasl_kwargs):
         if SASLClient is None:
             raise ImportError('The puresasl library has not been installed')
+        if 'host' in sasl_kwargs:
+            raise ValueError("kwargs should not contain 'host' since it is passed dynamically to new_authenticator")
         self.sasl_kwargs = sasl_kwargs
 
     def new_authenticator(self, host):
-        return SaslAuthenticator(**self.sasl_kwargs)
+        return SaslAuthenticator(host, **self.sasl_kwargs)
+
 
 class SaslAuthenticator(Authenticator):
     """

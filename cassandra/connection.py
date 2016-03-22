@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,29 +16,36 @@ from __future__ import absolute_import  # to enable import io from stdlib
 from collections import defaultdict, deque
 import errno
 from functools import wraps, partial
+from heapq import heappush, heappop
 import io
 import logging
-import os
+import six
+from six.moves import range
+import socket
+import struct
 import sys
 from threading import Thread, Event, RLock
 import time
+
+try:
+    import ssl
+except ImportError:
+    ssl = None  # NOQA
 
 if 'gevent.monkey' in sys.modules:
     from gevent.queue import Queue, Empty
 else:
     from six.moves.queue import Queue, Empty  # noqa
 
-import six
-from six.moves import range
-
 from cassandra import ConsistencyLevel, AuthenticationFailed, OperationTimedOut
-from cassandra.marshal import int32_pack, header_unpack, v3_header_unpack, int32_unpack
+from cassandra.marshal import int32_pack
 from cassandra.protocol import (ReadyMessage, AuthenticateMessage, OptionsMessage,
                                 StartupMessage, ErrorMessage, CredentialsMessage,
-                                QueryMessage, ResultMessage, decode_response,
+                                QueryMessage, ResultMessage, ProtocolHandler,
                                 InvalidRequestException, SupportedMessage,
                                 AuthResponseMessage, AuthChallengeMessage,
-                                AuthSuccessMessage, ProtocolException)
+                                AuthSuccessMessage, ProtocolException,
+                                MAX_SUPPORTED_VERSION, RegisterMessage)
 from cassandra.util import OrderedDict
 
 
@@ -88,8 +95,35 @@ HEADER_DIRECTION_FROM_CLIENT = 0x00
 HEADER_DIRECTION_TO_CLIENT = 0x80
 HEADER_DIRECTION_MASK = 0x80
 
-NONBLOCKING = (errno.EAGAIN, errno.EWOULDBLOCK)
+frame_header_v1_v2 = struct.Struct('>BbBi')
+frame_header_v3 = struct.Struct('>BhBi')
 
+
+class _Frame(object):
+    def __init__(self, version, flags, stream, opcode, body_offset, end_pos):
+        self.version = version
+        self.flags = flags
+        self.stream = stream
+        self.opcode = opcode
+        self.body_offset = body_offset
+        self.end_pos = end_pos
+
+    def __eq__(self, other):  # facilitates testing
+        if isinstance(other, _Frame):
+            return (self.version == other.version and
+                    self.flags == other.flags and
+                    self.stream == other.stream and
+                    self.opcode == other.opcode and
+                    self.body_offset == other.body_offset and
+                    self.end_pos == other.end_pos)
+        return NotImplemented
+
+    def __str__(self):
+        return "ver({0}); flags({1:04b}); stream({2}); op({3}); offset({4}); len({5})".format(self.version, self.flags, self.stream, self.opcode, self.body_offset, self.end_pos - self.body_offset)
+
+
+
+NONBLOCKING = (errno.EAGAIN, errno.EWOULDBLOCK)
 
 class ConnectionException(Exception):
     """
@@ -107,6 +141,16 @@ class ConnectionShutdown(ConnectionException):
     Raised when a connection has been marked as defunct or has been closed.
     """
     pass
+
+
+class ProtocolVersionUnsupported(ConnectionException):
+    """
+    Server rejected startup message due to unsupported protocol version
+    """
+    def __init__(self, host, startup_version):
+        super(ProtocolVersionUnsupported, self).__init__("Unsupported protocol version on %s: %d",
+                                                         (host, startup_version))
+        self.startup_version = startup_version
 
 
 class ConnectionBusy(Exception):
@@ -137,14 +181,22 @@ def defunct_on_error(f):
 
 DEFAULT_CQL_VERSION = '3.0.0'
 
+if six.PY3:
+    def int_from_buf_item(i):
+        return i
+else:
+    int_from_buf_item = ord
+
 
 class Connection(object):
+
+    CALLBACK_ERR_THREAD_THRESHOLD = 100
 
     in_buffer_size = 4096
     out_buffer_size = 4096
 
     cql_version = None
-    protocol_version = 2
+    protocol_version = MAX_SUPPORTED_VERSION
 
     keyspace = None
     compression = True
@@ -174,13 +226,25 @@ class Connection(object):
 
     msg_received = False
 
+    is_unsupported_proto_version = False
+
     is_control_connection = False
+    signaled_error = False  # used for flagging at the pool level
+
+    _server_version = None
+
     _iobuf = None
+    _current_frame = None
+
+    _socket = None
+
+    _socket_impl = socket
+    _ssl_impl = ssl
 
     def __init__(self, host='127.0.0.1', port=9042, authenticator=None,
                  ssl_options=None, sockopts=None, compression=True,
-                 cql_version=None, protocol_version=2, is_control_connection=False,
-                 user_type_map=None):
+                 cql_version=None, protocol_version=MAX_SUPPORTED_VERSION, is_control_connection=False,
+                 user_type_map=None, connect_timeout=None):
         self.host = host
         self.port = port
         self.authenticator = authenticator
@@ -191,40 +255,27 @@ class Connection(object):
         self.protocol_version = protocol_version
         self.is_control_connection = is_control_connection
         self.user_type_map = user_type_map
+        self.connect_timeout = connect_timeout
         self._push_watchers = defaultdict(set)
+        self._requests = {}
         self._iobuf = io.BytesIO()
+
         if protocol_version >= 3:
-            self._header_unpack = v3_header_unpack
-            self._header_length = 5
             self.max_request_id = (2 ** 15) - 1
             # Don't fill the deque with 2**15 items right away. Start with 300 and add
             # more if needed.
             self.request_ids = deque(range(300))
             self.highest_request_id = 299
         else:
-            self._header_unpack = header_unpack
-            self._header_length = 4
             self.max_request_id = (2 ** 7) - 1
             self.request_ids = deque(range(self.max_request_id + 1))
             self.highest_request_id = self.max_request_id
 
-        # 0         8        16        24        32         40
-        # +---------+---------+---------+---------+---------+
-        # | version |  flags  |      stream       | opcode  |
-        # +---------+---------+---------+---------+---------+
-        # |                length                 |
-        # +---------+---------+---------+---------+
-        # |                                       |
-        # .            ...  body ...              .
-        # .                                       .
-        # .                                       .
-        # +----------------------------------------
-        self._full_header_length = self._header_length + 4
-
         self.lock = RLock()
+        self.connected_event = Event()
 
     @classmethod
-    def initialize_reactor(self):
+    def initialize_reactor(cls):
         """
         Called once by Cluster.connect().  This should be used by implementations
         to set up any resources that will be shared across connections.
@@ -232,12 +283,65 @@ class Connection(object):
         pass
 
     @classmethod
-    def handle_fork(self):
+    def handle_fork(cls):
         """
         Called after a forking.  This should cleanup any remaining reactor state
         from the parent process.
         """
         pass
+
+    @classmethod
+    def create_timer(cls, timeout, callback):
+        raise NotImplementedError()
+
+    @classmethod
+    def factory(cls, host, timeout, *args, **kwargs):
+        """
+        A factory function which returns connections which have
+        succeeded in connecting and are ready for service (or
+        raises an exception otherwise).
+        """
+        start = time.time()
+        kwargs['connect_timeout'] = timeout
+        conn = cls(host, *args, **kwargs)
+        elapsed = time.time() - start
+        conn.connected_event.wait(timeout - elapsed)
+        if conn.last_error:
+            if conn.is_unsupported_proto_version:
+                raise ProtocolVersionUnsupported(host, conn.protocol_version)
+            raise conn.last_error
+        elif not conn.connected_event.is_set():
+            conn.close()
+            raise OperationTimedOut("Timed out creating connection (%s seconds)" % timeout)
+        else:
+            return conn
+
+    def _connect_socket(self):
+        sockerr = None
+        addresses = socket.getaddrinfo(self.host, self.port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for (af, socktype, proto, canonname, sockaddr) in addresses:
+            try:
+                self._socket = self._socket_impl.socket(af, socktype, proto)
+                if self.ssl_options:
+                    if not self._ssl_impl:
+                        raise Exception("This version of Python was not compiled with SSL support")
+                    self._socket = self._ssl_impl.wrap_socket(self._socket, **self.ssl_options)
+                self._socket.settimeout(self.connect_timeout)
+                self._socket.connect(sockaddr)
+                sockerr = None
+                break
+            except socket.error as err:
+                if self._socket:
+                    self._socket.close()
+                    self._socket = None
+                sockerr = err
+
+        if sockerr:
+            raise socket.error(sockerr.errno, "Tried connecting to %s. Last error: %s" % ([a[4] for a in addresses], sockerr.strerror or sockerr))
+
+        if self.sockopts:
+            for args in self.sockopts:
+                self._socket.setsockopt(*args)
 
     def close(self):
         raise NotImplementedError()
@@ -248,27 +352,59 @@ class Connection(object):
                 return
             self.is_defunct = True
 
-        log.debug("Defuncting connection (%s) to %s:",
-                  id(self), self.host, exc_info=exc)
+        exc_info = sys.exc_info()
+        # if we are not handling an exception, just use the passed exception, and don't try to format exc_info with the message
+        if any(exc_info):
+            log.debug("Defuncting connection (%s) to %s:",
+                      id(self), self.host, exc_info=exc_info)
+        else:
+            log.debug("Defuncting connection (%s) to %s: %s",
+                      id(self), self.host, exc)
 
         self.last_error = exc
         self.close()
-        self.error_all_callbacks(exc)
+        self.error_all_requests(exc)
         self.connected_event.set()
         return exc
 
-    def error_all_callbacks(self, exc):
+    def error_all_requests(self, exc):
         with self.lock:
-            callbacks = self._callbacks
-            self._callbacks = {}
+            requests = self._requests
+            self._requests = {}
+
+        if not requests:
+            return
+
         new_exc = ConnectionShutdown(str(exc))
-        for cb in callbacks.values():
+        def try_callback(cb):
             try:
                 cb(new_exc)
             except Exception:
-                log.warning("Ignoring unhandled exception while erroring callbacks for a "
+                log.warning("Ignoring unhandled exception while erroring requests for a "
                             "failed connection (%s) to host %s:",
                             id(self), self.host, exc_info=True)
+
+        # run first callback from this thread to ensure pool state before leaving
+        cb, _ = requests.popitem()[1]
+        try_callback(cb)
+
+        if not requests:
+            return
+
+        # additional requests are optionally errored from a separate thread
+        # The default callback and retry logic is fairly expensive -- we don't
+        # want to tie up the event thread when there are many requests
+        def err_all_callbacks():
+            for cb, _ in requests.values():
+                try_callback(cb)
+        if len(requests) < Connection.CALLBACK_ERR_THREAD_THRESHOLD:
+            err_all_callbacks()
+        else:
+            # daemon thread here because we want to stay decoupled from the cluster TPE
+            # TODO: would it make sense to just have a driver-global TPE?
+            t = Thread(target=err_all_callbacks)
+            t.daemon = True
+            t.start()
 
     def get_request_id(self):
         """
@@ -290,14 +426,16 @@ class Connection(object):
             except Exception:
                 log.exception("Pushed event handler errored, ignoring:")
 
-    def send_msg(self, msg, request_id, cb):
+    def send_msg(self, msg, request_id, cb, encoder=ProtocolHandler.encode_message, decoder=ProtocolHandler.decode_message):
         if self.is_defunct:
             raise ConnectionShutdown("Connection to %s is defunct" % self.host)
         elif self.is_closed:
             raise ConnectionShutdown("Connection to %s is closed" % self.host)
 
-        self._callbacks[request_id] = cb
-        self.push(msg.to_binary(request_id, self.protocol_version, compression=self.compressor))
+        # queue the decoder function with the request
+        # this allows us to inject custom functions per request to encode, decode messages
+        self._requests[request_id] = (cb, decoder)
+        self.push(encoder(msg, request_id, self.protocol_version, compressor=self.compressor))
         return request_id
 
     def wait_for_response(self, msg, timeout=None):
@@ -350,88 +488,90 @@ class Connection(object):
             self.defunct(exc)
             raise
 
-    def register_watcher(self, event_type, callback):
-        raise NotImplementedError()
+    def register_watcher(self, event_type, callback, register_timeout=None):
+        """
+        Register a callback for a given event type.
+        """
+        self._push_watchers[event_type].add(callback)
+        self.wait_for_response(
+            RegisterMessage(event_list=[event_type]),
+            timeout=register_timeout)
 
-    def register_watchers(self, type_callback_dict):
-        raise NotImplementedError()
+    def register_watchers(self, type_callback_dict, register_timeout=None):
+        """
+        Register multiple callback/event type pairs, expressed as a dict.
+        """
+        for event_type, callback in type_callback_dict.items():
+            self._push_watchers[event_type].add(callback)
+        self.wait_for_response(
+            RegisterMessage(event_list=type_callback_dict.keys()),
+            timeout=register_timeout)
 
     def control_conn_disposed(self):
         self.is_control_connection = False
         self._push_watchers = {}
 
+    @defunct_on_error
+    def _read_frame_header(self):
+        buf = self._iobuf.getvalue()
+        pos = len(buf)
+        if pos:
+            version = int_from_buf_item(buf[0]) & PROTOCOL_VERSION_MASK
+            if version > MAX_SUPPORTED_VERSION:
+                raise ProtocolError("This version of the driver does not support protocol version %d" % version)
+            frame_header = frame_header_v3 if version >= 3 else frame_header_v1_v2
+            # this frame header struct is everything after the version byte
+            header_size = frame_header.size + 1
+            if pos >= header_size:
+                flags, stream, op, body_len = frame_header.unpack_from(buf, 1)
+                if body_len < 0:
+                    raise ProtocolError("Received negative body length: %r" % body_len)
+                self._current_frame = _Frame(version, flags, stream, op, header_size, body_len + header_size)
+        return pos
+
+    def _reset_frame(self):
+        self._iobuf = io.BytesIO(self._iobuf.read())
+        self._iobuf.seek(0, 2)  # io.SEEK_END == 2 (constant not present in 2.6)
+        self._current_frame = None
+
     def process_io_buffer(self):
         while True:
-            pos = self._iobuf.tell()
-            if pos < self._full_header_length or (self._total_reqd_bytes > 0 and pos < self._total_reqd_bytes):
+            if not self._current_frame:
+                pos = self._read_frame_header()
+            else:
+                pos = self._iobuf.tell()
+
+            if not self._current_frame or pos < self._current_frame.end_pos:
                 # we don't have a complete header yet or we
                 # already saw a header, but we don't have a
                 # complete message yet
                 return
             else:
-                # have enough for header, read body len from header
-                self._iobuf.seek(self._header_length)
-                body_len = int32_unpack(self._iobuf.read(4))
-
-                # seek to end to get length of current buffer
-                self._iobuf.seek(0, os.SEEK_END)
-                pos = self._iobuf.tell()
-
-                if pos >= body_len + self._full_header_length:
-                    # read message header and body
-                    self._iobuf.seek(0)
-                    msg = self._iobuf.read(self._full_header_length + body_len)
-
-                    # leave leftover in current buffer
-                    leftover = self._iobuf.read()
-                    self._iobuf = io.BytesIO()
-                    self._iobuf.write(leftover)
-
-                    self._total_reqd_bytes = 0
-                    self.process_msg(msg, body_len)
-                else:
-                    self._total_reqd_bytes = body_len + self._full_header_length
-                    return
+                frame = self._current_frame
+                self._iobuf.seek(frame.body_offset)
+                msg = self._iobuf.read(frame.end_pos - frame.body_offset)
+                self.process_msg(frame, msg)
+                self._reset_frame()
 
     @defunct_on_error
-    def process_msg(self, msg, body_len):
-        version, flags, stream_id, opcode = self._header_unpack(msg[:self._header_length])
+    def process_msg(self, header, body):
+        stream_id = header.stream
         if stream_id < 0:
             callback = None
+            decoder = ProtocolHandler.decode_message
         else:
-            callback = self._callbacks.pop(stream_id, None)
+            callback, decoder = self._requests.pop(stream_id, None)
             with self.lock:
                 self.request_ids.append(stream_id)
 
         self.msg_received = True
 
-        body = None
         try:
-            # check that the protocol version is supported
-            given_version = version & PROTOCOL_VERSION_MASK
-            if given_version != self.protocol_version:
-                msg = "Server protocol version (%d) does not match the specified driver protocol version (%d). " +\
-                      "Consider setting Cluster.protocol_version to %d."
-                raise ProtocolError(msg % (given_version, self.protocol_version, given_version))
-
-            # check that the header direction is correct
-            if version & HEADER_DIRECTION_MASK != HEADER_DIRECTION_TO_CLIENT:
-                raise ProtocolError(
-                    "Header direction in response is incorrect; opcode %04x, stream id %r"
-                    % (opcode, stream_id))
-
-            if body_len > 0:
-                body = msg[self._full_header_length:]
-            elif body_len == 0:
-                body = six.binary_type()
-            else:
-                raise ProtocolError("Got negative body length: %r" % body_len)
-
-            response = decode_response(given_version, self.user_type_map, stream_id,
-                                       flags, opcode, body, self.decompressor)
+            response = decoder(header.version, self.user_type_map, stream_id,
+                               header.flags, header.opcode, body, self.decompressor)
         except Exception as exc:
             log.exception("Error decoding response from Cassandra. "
-                          "opcode: %04x; message contents: %r", opcode, msg)
+                          "%s; buffer: %r", header, self._iobuf.getvalue())
             if callback is not None:
                 callback(exc)
             self.defunct(exc)
@@ -440,6 +580,9 @@ class Connection(object):
         try:
             if stream_id >= 0:
                 if isinstance(response, ProtocolException):
+                    if 'unsupported protocol version' in response.message:
+                        self.is_unsupported_proto_version = True
+
                     log.error("Closing connection %s due to protocol error: %s", self, response.summary_msg())
                     self.defunct(response)
                 if callback is not None:
@@ -551,8 +694,6 @@ class Connection(object):
             if self.authenticator is None:
                 raise AuthenticationFailed('Remote end requires authentication.')
 
-            self.authenticator_class = startup_response.authenticator
-
             if isinstance(self.authenticator, dict):
                 log.debug("Sending credentials-based auth response on %s", self)
                 cm = CredentialsMessage(creds=self.authenticator)
@@ -560,6 +701,7 @@ class Connection(object):
                 self.send_msg(cm, self.get_request_id(), cb=callback)
             else:
                 log.debug("Sending SASL-based auth response on %s", self)
+                self.authenticator.server_authenticator_class = startup_response.authenticator
                 initial_response = self.authenticator.initial_response()
                 initial_response = "" if initial_response is None else initial_response
                 self.send_msg(AuthResponseMessage(initial_response), self.get_request_id(), self._handle_auth_response)
@@ -683,6 +825,18 @@ class Connection(object):
 
     def reset_idle(self):
         self.msg_received = False
+
+    @property
+    def server_version(self):
+        if self._server_version is None:
+            query_message = QueryMessage(query="SELECT release_version FROM system.local", consistency_level=ConsistencyLevel.ONE)
+            message = self.wait_for_response(query_message)
+            self._server_version = message.results[1][0][0]  # (col names, rows)[rows][first row][only item]
+        return self._server_version
+
+    @server_version.setter
+    def server_version(self, version):
+        self._server_version = version
 
     def __str__(self):
         status = ""
@@ -854,3 +1008,74 @@ class ConnectionHeartbeat(Thread):
     def _raise_if_stopped(self):
         if self._shutdown_event.is_set():
             raise self.ShutdownException()
+
+
+class Timer(object):
+
+    canceled = False
+
+    def __init__(self, timeout, callback):
+        self.end = time.time() + timeout
+        self.callback = callback
+        if timeout < 0:
+            self.callback()
+
+    def __lt__(self, other):
+        return self.end < other.end
+
+    def cancel(self):
+        self.canceled = True
+
+    def finish(self, time_now):
+        if self.canceled:
+            return True
+
+        if time_now >= self.end:
+            self.callback()
+            return True
+
+        return False
+
+
+class TimerManager(object):
+
+    def __init__(self):
+        self._queue = []
+        self._new_timers = []
+
+    def add_timer(self, timer):
+        """
+        called from client thread with a Timer object
+        """
+        self._new_timers.append((timer.end, timer))
+
+    def service_timeouts(self):
+        """
+        run callbacks on all expired timers
+        Called from the event thread
+        :return: next end time, or None
+        """
+        queue = self._queue
+        if self._new_timers:
+            new_timers = self._new_timers
+            while new_timers:
+                heappush(queue, new_timers.pop())
+
+        if queue:
+            now = time.time()
+            while queue:
+                try:
+                    timer = queue[0][1]
+                    if timer.finish(now):
+                        heappop(queue)
+                    else:
+                        return timer.end
+                except Exception:
+                    log.exception("Exception while servicing timeout callback: ")
+
+    @property
+    def next_timeout(self):
+        try:
+            return self._queue[0][0]
+        except IndexError:
+            pass

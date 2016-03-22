@@ -1,2 +1,2 @@
-futures
 six >=1.6
+futures

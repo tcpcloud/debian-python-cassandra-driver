@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import print_function
+import os
 import sys
 import warnings
 
@@ -36,9 +37,7 @@ from distutils.errors import (CCompilerError, DistutilsPlatformError,
                               DistutilsExecError)
 from distutils.cmd import Command
 
-
-import os
-import warnings
+PY3 = sys.version_info[0] == 3
 
 try:
     import subprocess
@@ -73,6 +72,8 @@ if __name__ == '__main__' and sys.argv[1] == "install":
     except ImportError:
         pass
 
+PROFILING = False
+
 
 class DocCommand(Command):
 
@@ -103,6 +104,23 @@ class DocCommand(Command):
                 pass
 
         if has_subprocess:
+            # Prevent run with in-place extensions because cython-generated objects do not carry docstrings
+            # http://docs.cython.org/src/userguide/special_methods.html#docstrings
+            import glob
+            for f in glob.glob("cassandra/*.so"):
+                print("Removing '%s' to allow docs to run on pure python modules." %(f,))
+                os.unlink(f)
+
+            # Build io extension to make import and docstrings work
+            try:
+                output = subprocess.check_output(
+                    ["python", "setup.py", "build_ext", "--inplace", "--force", "--no-murmur3", "--no-cython"],
+                    stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError("Documentation step '%s' failed: %s: %s" % ("build_ext", exc, exc.output))
+            else:
+                print(output)
+
             try:
                 output = subprocess.check_output(
                     ["sphinx-build", "-b", mode, "docs", path],
@@ -123,8 +141,8 @@ class BuildFailed(Exception):
         self.ext = ext
 
 
-murmur3_ext = Extension('cassandra.murmur3',
-                        sources=['cassandra/murmur3.c'])
+murmur3_ext = Extension('cassandra.cmurmur3',
+                        sources=['cassandra/cmurmur3.c'])
 
 libev_ext = Extension('cassandra.io.libevwrapper',
                       sources=['cassandra/io/libevwrapper.c'],
@@ -132,10 +150,85 @@ libev_ext = Extension('cassandra.io.libevwrapper',
                       libraries=['ev'],
                       library_dirs=['/usr/local/lib', '/opt/local/lib'])
 
+platform_unsupported_msg = \
+"""
+===============================================================================
+The optional C extensions are not supported on this platform.
+===============================================================================
+"""
+
+arch_unsupported_msg = \
+"""
+===============================================================================
+The optional C extensions are not supported on big-endian systems.
+===============================================================================
+"""
+
+pypy_unsupported_msg = \
+"""
+=================================================================================
+Some optional C extensions are not supported in PyPy. Only murmur3 will be built.
+=================================================================================
+"""
+
+is_windows = os.name == 'nt'
+
+is_pypy = "PyPy" in sys.version
+if is_pypy:
+    sys.stderr.write(pypy_unsupported_msg)
+
+is_supported_platform = sys.platform != "cli" and not sys.platform.startswith("java")
+is_supported_arch = sys.byteorder != "big"
+if not is_supported_platform:
+    sys.stderr.write(platform_unsupported_msg)
+elif not is_supported_arch:
+    sys.stderr.write(arch_unsupported_msg)
+
+try_extensions = "--no-extensions" not in sys.argv and is_supported_platform and is_supported_arch and not os.environ.get('CASS_DRIVER_NO_EXTENSIONS')
+try_murmur3 = try_extensions and "--no-murmur3" not in sys.argv
+try_libev = try_extensions and "--no-libev" not in sys.argv and not is_pypy and not is_windows
+try_cython = try_extensions and "--no-cython" not in sys.argv and not is_pypy and not os.environ.get('CASS_DRIVER_NO_CYTHON')
+try_cython &= 'egg_info' not in sys.argv  # bypass setup_requires for pip egg_info calls, which will never have --install-option"--no-cython" coming fomr pip
+
+sys.argv = [a for a in sys.argv if a not in ("--no-murmur3", "--no-libev", "--no-cython", "--no-extensions")]
+
+build_concurrency = int(os.environ.get('CASS_DRIVER_BUILD_CONCURRENCY', '0'))
+
+
+class NoPatchExtension(Extension):
+
+    # Older versions of setuptools.extension has a static flag which is set False before our
+    # setup_requires lands Cython. It causes our *.pyx sources to be renamed to *.c in
+    # the initializer.
+    # The other workaround would be to manually generate sources, but that bypasses a lot
+    # of the niceness cythonize embodies (setup build dir, conditional build, etc).
+    # Newer setuptools does not have this problem because it checks for cython dynamically.
+    # https://bitbucket.org/pypa/setuptools/commits/714c3144e08fd01a9f61d1c88411e76d2538b2e4
+
+    def __init__(self, *args, **kwargs):
+        # bypass the patched init if possible
+        if Extension.__bases__:
+            base, = Extension.__bases__
+            base.__init__(self, *args, **kwargs)
+        else:
+            Extension.__init__(self, *args, **kwargs)
+        
 
 class build_extensions(build_ext):
 
     error_message = """
+===============================================================================
+WARNING: could not compile %s.
+
+The C extensions are not required for the driver to run, but they add support
+for token-aware routing with the Murmur3Partitioner.
+
+On Windows, make sure Visual Studio or an SDK is installed, and your environment
+is configured to build for the appropriate architecture (matching your Python runtime).
+This is often a matter of using vcvarsall.bat from your install directory, or running
+from a command prompt in the Visual Studio Tools Start Menu.
+===============================================================================
+""" if is_windows else """
 ===============================================================================
 WARNING: could not compile %s.
 
@@ -175,10 +268,20 @@ On OSX, via homebrew:
 
     def run(self):
         try:
+            self._setup_extensions()
             build_ext.run(self)
         except DistutilsPlatformError as exc:
             sys.stderr.write('%s\n' % str(exc))
             warnings.warn(self.error_message % "C extensions.")
+
+    def build_extensions(self):
+        if build_concurrency > 1:
+            self.check_extensions_list(self.extensions)
+
+            import multiprocessing.pool
+            multiprocessing.pool.ThreadPool(processes=build_concurrency).map(self.build_extension, self.extensions)
+        else:
+            build_ext.build_extensions(self)
 
     def build_extension(self, ext):
         try:
@@ -188,7 +291,83 @@ On OSX, via homebrew:
             sys.stderr.write('%s\n' % str(exc))
             name = "The %s extension" % (ext.name,)
             warnings.warn(self.error_message % (name,))
-            raise BuildFailed(ext)
+
+    def _setup_extensions(self):
+        # We defer extension setup until this command to leveraage 'setup_requires' pulling in Cython before we
+        # attempt to import anything
+        self.extensions = []
+
+        if try_murmur3:
+            self.extensions.append(murmur3_ext)
+
+        if try_libev:
+            self.extensions.append(libev_ext)
+
+        if try_cython:
+            try:
+                from Cython.Build import cythonize
+                cython_candidates = ['cluster', 'concurrent', 'connection', 'cqltypes', 'metadata',
+                                     'pool', 'protocol', 'query', 'util']
+                compile_args = [] if is_windows else ['-Wno-unused-function']
+                self.extensions.extend(cythonize(
+                    [Extension('cassandra.%s' % m, ['cassandra/%s.py' % m],
+                               extra_compile_args=compile_args)
+                        for m in cython_candidates],
+                    nthreads=build_concurrency,
+                    exclude_failures=True))
+
+                self.extensions.extend(cythonize(NoPatchExtension("*", ["cassandra/*.pyx"], extra_compile_args=compile_args),
+                                                 nthreads=build_concurrency))
+            except Exception:
+                sys.stderr.write("Failed to cythonize one or more modules. These will not be compiled as extensions (optional).\n")
+
+
+def pre_build_check():
+    """
+    Try to verify build tools
+    """
+    if os.environ.get('CASS_DRIVER_NO_PRE_BUILD_CHECK'):
+        return True
+
+    try:
+        from distutils.ccompiler import new_compiler
+        from distutils.sysconfig import customize_compiler
+        from distutils.dist import Distribution
+
+        # base build_ext just to emulate compiler option setup
+        be = build_ext(Distribution())
+        be.initialize_options()
+        be.finalize_options()
+
+        # First, make sure we have a Python include directory
+        have_python_include = any(os.path.isfile(os.path.join(p, 'Python.h')) for p in be.include_dirs)
+        if not have_python_include:
+            sys.stderr.write("Did not find 'Python.h' in %s.\n" % (be.include_dirs,))
+            return False
+
+        compiler = new_compiler(compiler=be.compiler)
+        customize_compiler(compiler)
+
+        executables = []
+        if compiler.compiler_type in ('unix', 'cygwin'):
+            executables = [compiler.executables[exe][0] for exe in ('compiler_so', 'linker_so')]
+        elif compiler.compiler_type == 'nt':
+            executables = [getattr(compiler, exe) for exe in ('cc', 'linker')]
+
+        if executables:
+            from distutils.spawn import find_executable
+            for exe in executables:
+                if not find_executable(exe):
+                    sys.stderr.write("Failed to find %s for compiler type %s.\n" % (exe, compiler.compiler_type))
+                    return False
+
+    except Exception as exc:
+        sys.stderr.write('%s\n' % str(exc))
+        sys.stderr.write("Failed pre-build check. Attempting anyway.\n")
+
+    # if we are unable to positively id the compiler type, or one of these assumptions fails,
+    # just proceed as we would have without the check
+    return True
 
 
 def run_setup(extensions):
@@ -200,11 +379,23 @@ def run_setup(extensions):
     if eventlet_nosetests is not None:
         kw['cmdclass']['eventlet_nosetests'] = eventlet_nosetests
 
-    if extensions:
-        kw['cmdclass']['build_ext'] = build_extensions
-        kw['ext_modules'] = extensions
+    kw['cmdclass']['build_ext'] = build_extensions
+    kw['ext_modules'] = [Extension('DUMMY', [])]  # dummy extension makes sure build_ext is called for install
 
-    dependencies = ['futures', 'six >=1.6']
+    if try_cython:
+        # precheck compiler before adding to setup_requires
+        # we don't actually negate try_cython because:
+        # 1.) build_ext eats errors at compile time, letting the install complete while producing useful feedback
+        # 2.) there could be a case where the python environment has cython installed but the system doesn't have build tools
+        if pre_build_check():
+            kw['setup_requires'] = ['Cython>=0.20']
+        else:
+            sys.stderr.write("Bypassing Cython setup requirement\n")
+
+    dependencies = ['six >=1.6']
+
+    if not PY3:
+        dependencies.append('futures')
 
     setup(
         name='cassandra-driver',
@@ -218,7 +409,7 @@ def run_setup(extensions):
         keywords='cassandra,cql,orm',
         include_package_data=True,
         install_requires=dependencies,
-        tests_require=['nose', 'mock', 'PyYAML', 'pytz', 'sure'],
+        tests_require=['nose', 'mock<=1.0.1', 'PyYAML', 'pytz', 'sure'],
         classifiers=[
             'Development Status :: 5 - Production/Stable',
             'Intended Audience :: Developers',
@@ -236,50 +427,7 @@ def run_setup(extensions):
         ],
         **kw)
 
-extensions = [murmur3_ext, libev_ext]
-if "--no-extensions" in sys.argv:
-    sys.argv = [a for a in sys.argv if a != "--no-extensions"]
-    extensions = []
-elif "--no-murmur3" in sys.argv:
-    sys.argv = [a for a in sys.argv if a != "--no-murmur3"]
-    extensions.remove(murmur3_ext)
-elif "--no-libev" in sys.argv:
-    sys.argv = [a for a in sys.argv if a != "--no-libev"]
-    extensions.remove(libev_ext)
-
-
-platform_unsupported_msg = \
-"""
-===============================================================================
-The optional C extensions are not supported on this platform.
-===============================================================================
-"""
-
-arch_unsupported_msg = \
-"""
-===============================================================================
-The optional C extensions are not supported on big-endian systems.
-===============================================================================
-"""
-
-if extensions:
-    if (sys.platform.startswith("java")
-            or sys.platform == "cli"
-            or "PyPy" in sys.version):
-        sys.stderr.write(platform_unsupported_msg)
-        extensions = ()
-    elif sys.byteorder == "big":
-        sys.stderr.write(arch_unsupported_msg)
-        extensions = ()
-
-while True:
-    # try to build as many of the extensions as we can
-    try:
-        run_setup(extensions)
-    except BuildFailed as failure:
-        extensions.remove(failure.ext)
-    else:
-        break
+run_setup(None)
 
 if has_cqlengine:
     warnings.warn("\n#######\n'cqlengine' package is present on path: %s\n"

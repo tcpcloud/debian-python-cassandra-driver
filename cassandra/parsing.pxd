@@ -12,26 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import six
+from cassandra.bytesio cimport BytesIOReader
+from cassandra.deserializers cimport Deserializer
 
+cdef class ParseDesc:
+    cdef public object colnames
+    cdef public object coltypes
+    cdef Deserializer[::1] deserializers
+    cdef public int protocol_version
+    cdef Py_ssize_t rowsize
 
-# Caching constants.
-CACHING_ALL = "ALL"
-CACHING_KEYS_ONLY = "KEYS_ONLY"
-CACHING_ROWS_ONLY = "ROWS_ONLY"
-CACHING_NONE = "NONE"
+cdef class ColumnParser:
+    cpdef parse_rows(self, BytesIOReader reader, ParseDesc desc)
 
+cdef class RowParser:
+    cpdef unpack_row(self, BytesIOReader reader, ParseDesc desc)
 
-class CQLEngineException(Exception):
-    pass
-
-
-class ValidationError(CQLEngineException):
-    pass
-
-
-class UnicodeMixin(object):
-    if six.PY3:
-        __str__ = lambda x: x.__unicode__()
-    else:
-        __str__ = lambda x: six.text_type(x).encode('utf-8')
