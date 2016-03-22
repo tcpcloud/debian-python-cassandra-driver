@@ -1,4 +1,4 @@
-# Copyright 2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import division
 from datetime import datetime
 
 from cassandra.cqlengine import UnicodeMixin, ValidationError
+
+import sys
+
+if sys.version_info >= (2, 7):
+    def get_total_seconds(td):
+        return td.total_seconds()
+else:
+    def get_total_seconds(td):
+        # integer division used here to emulate built-in total_seconds
+        return ((86400 * td.days + td.seconds) * 10 ** 6 + td.microseconds) / 10 ** 6
 
 
 class QueryValue(UnicodeMixin):
@@ -23,7 +34,7 @@ class QueryValue(UnicodeMixin):
     be passed into .filter() keyword args
     """
 
-    format_string = '%({})s'
+    format_string = '%({0})s'
 
     def __init__(self, value):
         self.value = value
@@ -51,58 +62,43 @@ class BaseQueryFunction(QueryValue):
     pass
 
 
-class MinTimeUUID(BaseQueryFunction):
+class TimeUUIDQueryFunction(BaseQueryFunction):
+
+    def __init__(self, value):
+        """
+        :param value: the time to create bounding time uuid from
+        :type value: datetime
+        """
+        if not isinstance(value, datetime):
+            raise ValidationError('datetime instance is required')
+        super(TimeUUIDQueryFunction, self).__init__(value)
+
+    def to_database(self, val):
+        epoch = datetime(1970, 1, 1, tzinfo=val.tzinfo)
+        offset = get_total_seconds(epoch.tzinfo.utcoffset(epoch)) if epoch.tzinfo else 0
+        return int((get_total_seconds(val - epoch) - offset) * 1000)
+
+    def update_context(self, ctx):
+        ctx[str(self.context_id)] = self.to_database(self.value)
+
+
+class MinTimeUUID(TimeUUIDQueryFunction):
     """
     return a fake timeuuid corresponding to the smallest possible timeuuid for the given timestamp
 
     http://cassandra.apache.org/doc/cql3/CQL.html#timeuuidFun
     """
-
-    format_string = 'MinTimeUUID(%({})s)'
-
-    def __init__(self, value):
-        """
-        :param value: the time to create a maximum time uuid from
-        :type value: datetime
-        """
-        if not isinstance(value, datetime):
-            raise ValidationError('datetime instance is required')
-        super(MinTimeUUID, self).__init__(value)
-
-    def to_database(self, val):
-        epoch = datetime(1970, 1, 1, tzinfo=val.tzinfo)
-        offset = epoch.tzinfo.utcoffset(epoch).total_seconds() if epoch.tzinfo else 0
-        return int(((val - epoch).total_seconds() - offset) * 1000)
-
-    def update_context(self, ctx):
-        ctx[str(self.context_id)] = self.to_database(self.value)
+    format_string = 'MinTimeUUID(%({0})s)'
 
 
-class MaxTimeUUID(BaseQueryFunction):
+class MaxTimeUUID(TimeUUIDQueryFunction):
     """
     return a fake timeuuid corresponding to the largest possible timeuuid for the given timestamp
 
     http://cassandra.apache.org/doc/cql3/CQL.html#timeuuidFun
     """
+    format_string = 'MaxTimeUUID(%({0})s)'
 
-    format_string = 'MaxTimeUUID(%({})s)'
-
-    def __init__(self, value):
-        """
-        :param value: the time to create a minimum time uuid from
-        :type value: datetime
-        """
-        if not isinstance(value, datetime):
-            raise ValidationError('datetime instance is required')
-        super(MaxTimeUUID, self).__init__(value)
-
-    def to_database(self, val):
-        epoch = datetime(1970, 1, 1, tzinfo=val.tzinfo)
-        offset = epoch.tzinfo.utcoffset(epoch).total_seconds() if epoch.tzinfo else 0
-        return int(((val - epoch).total_seconds() - offset) * 1000)
-
-    def update_context(self, ctx):
-        ctx[str(self.context_id)] = self.to_database(self.value)
 
 
 class Token(BaseQueryFunction):
@@ -125,8 +121,8 @@ class Token(BaseQueryFunction):
         return len(self.value)
 
     def __unicode__(self):
-        token_args = ', '.join('%({})s'.format(self.context_id + i) for i in range(self.get_context_size()))
-        return "token({})".format(token_args)
+        token_args = ', '.join('%({0})s'.format(self.context_id + i) for i in range(self.get_context_size()))
+        return "token({0})".format(token_args)
 
     def update_context(self, ctx):
         for i, (col, val) in enumerate(zip(self._columns, self.value)):

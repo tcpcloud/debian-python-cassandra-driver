@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,16 +15,15 @@
 Module that implements an event loop based on twisted
 ( https://twistedmatrix.com ).
 """
-from twisted.internet import reactor, protocol
-from threading import Event, Thread, Lock
+import atexit
 from functools import partial
 import logging
+from threading import Thread, Lock
+import time
+from twisted.internet import reactor, protocol
 import weakref
-import atexit
 
-from cassandra import OperationTimedOut
-from cassandra.connection import Connection, ConnectionShutdown
-from cassandra.protocol import RegisterMessage
+from cassandra.connection import Connection, ConnectionShutdown, Timer, TimerManager
 
 
 log = logging.getLogger(__name__)
@@ -97,7 +96,7 @@ class TwistedConnectionClientFactory(protocol.ClientFactory):
 
         It should be safe to call defunct() here instead of just close, because
         we can assume that if the connection was closed cleanly, there are no
-        callbacks to error out. If this assumption turns out to be false, we
+        requests to error out. If this assumption turns out to be false, we
         can call close() instead of defunct() when "reason" is an appropriate
         type.
         """
@@ -109,9 +108,12 @@ class TwistedLoop(object):
 
     _lock = None
     _thread = None
+    _timeout_task = None
+    _timeout = None
 
     def __init__(self):
         self._lock = Lock()
+        self._timers = TimerManager()
 
     def maybe_start(self):
         with self._lock:
@@ -133,6 +135,27 @@ class TwistedLoop(object):
                             "Cluster.shutdown() to avoid this.")
             log.debug("Event loop thread was joined")
 
+    def add_timer(self, timer):
+        self._timers.add_timer(timer)
+        # callFromThread to schedule from the loop thread, where
+        # the timeout task can safely be modified
+        reactor.callFromThread(self._schedule_timeout, timer.end)
+
+    def _schedule_timeout(self, next_timeout):
+        if next_timeout:
+            delay = max(next_timeout - time.time(), 0)
+            if self._timeout_task and self._timeout_task.active():
+                if next_timeout < self._timeout:
+                    self._timeout_task.reset(delay)
+                    self._timeout = next_timeout
+            else:
+                self._timeout_task = reactor.callLater(delay, self._on_loop_timer)
+                self._timeout = next_timeout
+
+    def _on_loop_timer(self):
+        self._timers.service_timeouts()
+        self._schedule_timeout(self._timers.next_timeout)
+
 
 class TwistedConnection(Connection):
     """
@@ -141,7 +164,6 @@ class TwistedConnection(Connection):
     """
 
     _loop = None
-    _total_reqd_bytes = 0
 
     @classmethod
     def initialize_reactor(cls):
@@ -149,22 +171,10 @@ class TwistedConnection(Connection):
             cls._loop = TwistedLoop()
 
     @classmethod
-    def factory(cls, *args, **kwargs):
-        """
-        A factory function which returns connections which have
-        succeeded in connecting and are ready for service (or
-        raises an exception otherwise).
-        """
-        timeout = kwargs.pop('timeout', 5.0)
-        conn = cls(*args, **kwargs)
-        conn.connected_event.wait(timeout)
-        if conn.last_error:
-            raise conn.last_error
-        elif not conn.connected_event.is_set():
-            conn.close()
-            raise OperationTimedOut("Timed out creating connection")
-        else:
-            return conn
+    def create_timer(cls, timeout, callback):
+        timer = Timer(timeout, callback)
+        cls._loop.add_timer(timer)
+        return timer
 
     def __init__(self, *args, **kwargs):
         """
@@ -177,11 +187,9 @@ class TwistedConnection(Connection):
         """
         Connection.__init__(self, *args, **kwargs)
 
-        self.connected_event = Event()
         self.is_closed = True
         self.connector = None
 
-        self._callbacks = {}
         reactor.callFromThread(self.add_connection)
         self._loop.maybe_start()
 
@@ -192,7 +200,8 @@ class TwistedConnection(Connection):
         """
         self.connector = reactor.connectTCP(
             host=self.host, port=self.port,
-            factory=TwistedConnectionClientFactory(self))
+            factory=TwistedConnectionClientFactory(self),
+            timeout=self.connect_timeout)
 
     def client_connection_made(self):
         """
@@ -205,7 +214,7 @@ class TwistedConnection(Connection):
 
     def close(self):
         """
-        Disconnect and error-out all callbacks.
+        Disconnect and error-out all requests.
         """
         with self.lock:
             if self.is_closed:
@@ -217,7 +226,7 @@ class TwistedConnection(Connection):
         log.debug("Closed socket to %s", self.host)
 
         if not self.is_defunct:
-            self.error_all_callbacks(
+            self.error_all_requests(
                 ConnectionShutdown("Connection to %s was closed" % self.host))
             # don't leave in-progress operations hanging
             self.connected_event.set()
@@ -238,22 +247,3 @@ class TwistedConnection(Connection):
         the event loop when it gets the chance.
         """
         reactor.callFromThread(self.connector.transport.write, data)
-
-    def register_watcher(self, event_type, callback, register_timeout=None):
-        """
-        Register a callback for a given event type.
-        """
-        self._push_watchers[event_type].add(callback)
-        self.wait_for_response(
-            RegisterMessage(event_list=[event_type]),
-            timeout=register_timeout)
-
-    def register_watchers(self, type_callback_dict, register_timeout=None):
-        """
-        Register multiple callback/event type pairs, expressed as a dict.
-        """
-        for event_type, callback in type_callback_dict.items():
-            self._push_watchers[event_type].add(callback)
-        self.wait_for_response(
-            RegisterMessage(event_list=type_callback_dict.keys()),
-            timeout=register_timeout)

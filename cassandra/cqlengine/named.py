@@ -1,4 +1,4 @@
-# Copyright 2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -63,7 +63,7 @@ class NamedColumn(AbstractQueryableColumn):
         return self.get_cql()
 
     def get_cql(self):
-        return '"{}"'.format(self.name)
+        return '"{0}"'.format(self.name)
 
     def to_database(self, val):
         return val
@@ -97,7 +97,7 @@ class NamedTable(object):
         otherwise, it creates it from the module and class name
         """
         if include_keyspace:
-            return '{}.{}'.format(self.keyspace, self.name)
+            return '{0}.{1}'.format(self.keyspace, self.name)
         else:
             return self.name
 

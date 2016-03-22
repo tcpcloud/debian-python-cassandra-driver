@@ -1,4 +1,4 @@
-# Copyright 2013-2015 DataStax, Inc.
+# Copyright 2013-2016 DataStax, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from __future__ import absolute_import  # to enable import io from stdlib
+from collections import namedtuple
 import logging
 import socket
 from uuid import UUID
@@ -21,9 +22,12 @@ import six
 from six.moves import range
 import io
 
+from cassandra import type_codes
 from cassandra import (Unavailable, WriteTimeout, ReadTimeout,
+                       WriteFailure, ReadFailure, FunctionFailure,
                        AlreadyExists, InvalidRequest, Unauthorized,
-                       UnsupportedOperation)
+                       UnsupportedOperation, UserFunctionDescriptor,
+                       UserAggregateDescriptor, SchemaTargetType)
 from cassandra.marshal import (int32_pack, int32_unpack, uint16_pack, uint16_unpack,
                                int8_pack, int8_unpack, uint64_pack, header_pack,
                                v3_header_pack)
@@ -32,10 +36,12 @@ from cassandra.cqltypes import (AsciiType, BytesType, BooleanType,
                                 DoubleType, FloatType, Int32Type,
                                 InetAddressType, IntegerType, ListType,
                                 LongType, MapType, SetType, TimeUUIDType,
-                                UTF8Type, UUIDType, UserType,
+                                UTF8Type, VarcharType, UUIDType, UserType,
                                 TupleType, lookup_casstype, SimpleDateType,
-                                TimeType)
+                                TimeType, ByteType, ShortType)
 from cassandra.policies import WriteType
+from cassandra.cython_deps import HAVE_CYTHON, HAVE_NUMPY
+from cassandra import util
 
 log = logging.getLogger(__name__)
 
@@ -47,47 +53,52 @@ class NotSupportedError(Exception):
 class InternalError(Exception):
     pass
 
+ColumnMetadata = namedtuple("ColumnMetadata", ['keyspace_name', 'table_name', 'name', 'type'])
 
-HEADER_DIRECTION_FROM_CLIENT = 0x00
+MIN_SUPPORTED_VERSION = 1
+MAX_SUPPORTED_VERSION = 4
+
 HEADER_DIRECTION_TO_CLIENT = 0x80
 HEADER_DIRECTION_MASK = 0x80
 
 COMPRESSED_FLAG = 0x01
 TRACING_FLAG = 0x02
+CUSTOM_PAYLOAD_FLAG = 0x04
+WARNING_FLAG = 0x08
 
-_message_types_by_name = {}
 _message_types_by_opcode = {}
+
+_UNSET_VALUE = object()
+
+
+def register_class(cls):
+    _message_types_by_opcode[cls.opcode] = cls
+
+
+def get_registered_classes():
+    return _message_types_by_opcode.copy()
 
 
 class _RegisterMessageType(type):
     def __init__(cls, name, bases, dct):
         if not name.startswith('_'):
-            _message_types_by_name[cls.name] = cls
-            _message_types_by_opcode[cls.opcode] = cls
+            register_class(cls)
 
 
 @six.add_metaclass(_RegisterMessageType)
 class _MessageType(object):
 
     tracing = False
+    custom_payload = None
+    warnings = None
 
-    def to_binary(self, stream_id, protocol_version, compression=None):
-        body = io.BytesIO()
-        self.send_body(body, protocol_version)
-        body = body.getvalue()
-
-        flags = 0
-        if compression and len(body) > 0:
-            body = compression(body)
-            flags |= COMPRESSED_FLAG
-        if self.tracing:
-            flags |= TRACING_FLAG
-
-        msg = io.BytesIO()
-        write_header(msg, protocol_version, flags, stream_id, self.opcode, len(body))
-        msg.write(body)
-
-        return msg.getvalue()
+    def update_custom_payload(self, other):
+        if other:
+            if not self.custom_payload:
+                self.custom_payload = {}
+            self.custom_payload.update(other)
+            if len(self.custom_payload) > 65535:
+                raise ValueError("Custom payload map exceeds max count allowed by protocol (65535)")
 
     def __repr__(self):
         return '<%s(%s)>' % (self.__class__.__name__, ', '.join('%s=%r' % i for i in _get_params(self)))
@@ -99,31 +110,6 @@ def _get_params(message_obj):
         (n, a) for n, a in message_obj.__dict__.items()
         if n not in base_attrs and not n.startswith('_') and not callable(a)
     )
-
-
-def decode_response(protocol_version, user_type_map, stream_id, flags, opcode, body,
-                    decompressor=None):
-    if flags & COMPRESSED_FLAG:
-        if decompressor is None:
-            raise Exception("No de-compressor available for compressed frame!")
-        body = decompressor(body)
-        flags ^= COMPRESSED_FLAG
-
-    body = io.BytesIO(body)
-    if flags & TRACING_FLAG:
-        trace_id = UUID(bytes=body.read(16))
-        flags ^= TRACING_FLAG
-    else:
-        trace_id = None
-
-    if flags:
-        log.warning("Unknown protocol flags set: %02x. May cause problems.", flags)
-
-    msg_class = _message_types_by_opcode[opcode]
-    msg = msg_class.recv_body(body, protocol_version, user_type_map)
-    msg.stream_id = stream_id
-    msg.trace_id = trace_id
-    return msg
 
 
 error_classes = {}
@@ -261,6 +247,58 @@ class ReadTimeoutErrorMessage(RequestExecutionException):
 
     def to_exception(self):
         return ReadTimeout(self.summary_msg(), **self.info)
+
+
+class ReadFailureMessage(RequestExecutionException):
+    summary = "Replica(s) failed to execute read"
+    error_code = 0x1300
+
+    @staticmethod
+    def recv_error_info(f):
+        return {
+            'consistency': read_consistency_level(f),
+            'received_responses': read_int(f),
+            'required_responses': read_int(f),
+            'failures': read_int(f),
+            'data_retrieved': bool(read_byte(f)),
+        }
+
+    def to_exception(self):
+        return ReadFailure(self.summary_msg(), **self.info)
+
+
+class FunctionFailureMessage(RequestExecutionException):
+    summary = "User Defined Function failure"
+    error_code = 0x1400
+
+    @staticmethod
+    def recv_error_info(f):
+        return {
+            'keyspace': read_string(f),
+            'function': read_string(f),
+            'arg_types': [read_string(f) for _ in range(read_short(f))],
+        }
+
+    def to_exception(self):
+        return FunctionFailure(self.summary_msg(), **self.info)
+
+
+class WriteFailureMessage(RequestExecutionException):
+    summary = "Replica(s) failed to execute write"
+    error_code = 0x1500
+
+    @staticmethod
+    def recv_error_info(f):
+        return {
+            'consistency': read_consistency_level(f),
+            'received_responses': read_int(f),
+            'required_responses': read_int(f),
+            'failures': read_int(f),
+            'write_type': WriteType.name_to_value[read_string(f)],
+        }
+
+    def to_exception(self):
+        return WriteFailure(self.summary_msg(), **self.info)
 
 
 class SyntaxException(RequestValidationException):
@@ -453,11 +491,15 @@ class QueryMessage(_MessageType):
         self.fetch_size = fetch_size
         self.paging_state = paging_state
         self.timestamp = timestamp
+        self._query_params = None  # only used internally. May be set to a list of native-encoded values to have them sent with the request.
 
     def send_body(self, f, protocol_version):
         write_longstring(f, self.query)
         write_consistency_level(f, self.consistency_level)
         flags = 0x00
+        if self._query_params is not None:
+            flags |= _VALUES_FLAG  # also v2+, but we're only setting params internally right now
+
         if self.serial_consistency_level:
             if protocol_version >= 2:
                 flags |= _WITH_SERIAL_CONSISTENCY_FLAG
@@ -487,6 +529,12 @@ class QueryMessage(_MessageType):
             flags |= _PROTOCOL_TIMESTAMP
 
         write_byte(f, flags)
+
+        if self._query_params is not None:
+            write_short(f, len(self._query_params))
+            for param in self._query_params:
+                write_value(f, param)
+
         if self.fetch_size:
             write_int(f, self.fetch_size)
         if self.paging_state:
@@ -504,7 +552,6 @@ RESULT_KIND_SET_KEYSPACE = 0x0003
 RESULT_KIND_PREPARED = 0x0004
 RESULT_KIND_SCHEMA_CHANGE = 0x0005
 
-
 class ResultMessage(_MessageType):
     opcode = 0x08
     name = 'RESULT'
@@ -513,32 +560,8 @@ class ResultMessage(_MessageType):
     results = None
     paging_state = None
 
-    _type_codes = {
-        0x0000: CUSTOM_TYPE,
-        0x0001: AsciiType,
-        0x0002: LongType,
-        0x0003: BytesType,
-        0x0004: BooleanType,
-        0x0005: CounterColumnType,
-        0x0006: DecimalType,
-        0x0007: DoubleType,
-        0x0008: FloatType,
-        0x0009: Int32Type,
-        0x000A: UTF8Type,
-        0x000B: DateType,
-        0x000C: UUIDType,
-        0x000D: UTF8Type,
-        0x000E: IntegerType,
-        0x000F: TimeUUIDType,
-        0x0010: InetAddressType,
-        0x0011: SimpleDateType,
-        0x0012: TimeType,
-        0x0020: ListType,
-        0x0021: MapType,
-        0x0022: SetType,
-        0x0030: UserType,
-        0x0031: TupleType,
-    }
+    # Names match type name in module scope. Most are imported from cassandra.cqltypes (except CUSTOM_TYPE)
+    type_codes = _cqltypes_by_code = dict((v, globals()[k]) for k, v in type_codes.__dict__.items() if not k.startswith('_'))
 
     _FLAGS_GLOBAL_TABLES_SPEC = 0x0001
     _HAS_MORE_PAGES_FLAG = 0x0002
@@ -562,9 +585,11 @@ class ResultMessage(_MessageType):
             ksname = read_string(f)
             results = ksname
         elif kind == RESULT_KIND_PREPARED:
-            results = cls.recv_results_prepared(f, user_type_map)
+            results = cls.recv_results_prepared(f, protocol_version, user_type_map)
         elif kind == RESULT_KIND_SCHEMA_CHANGE:
             results = cls.recv_results_schema_change(f, protocol_version)
+        else:
+            raise Exception("Unknown RESULT kind: %d" % kind)
         return cls(kind, results, paging_state)
 
     @classmethod
@@ -581,16 +606,17 @@ class ResultMessage(_MessageType):
         return (paging_state, (colnames, parsed_rows))
 
     @classmethod
-    def recv_results_prepared(cls, f, user_type_map):
+    def recv_results_prepared(cls, f, protocol_version, user_type_map):
         query_id = read_binary_string(f)
-        _, column_metadata = cls.recv_results_metadata(f, user_type_map)
-        return (query_id, column_metadata)
+        column_metadata, pk_indexes = cls.recv_prepared_metadata(f, protocol_version, user_type_map)
+        return (query_id, column_metadata, pk_indexes)
 
     @classmethod
     def recv_results_metadata(cls, f, user_type_map):
         flags = read_int(f)
         glob_tblspec = bool(flags & cls._FLAGS_GLOBAL_TABLES_SPEC)
         colcount = read_int(f)
+
         if flags & cls._HAS_MORE_PAGES_FLAG:
             paging_state = read_binary_longstring(f)
         else:
@@ -612,6 +638,32 @@ class ResultMessage(_MessageType):
         return paging_state, column_metadata
 
     @classmethod
+    def recv_prepared_metadata(cls, f, protocol_version, user_type_map):
+        flags = read_int(f)
+        glob_tblspec = bool(flags & cls._FLAGS_GLOBAL_TABLES_SPEC)
+        colcount = read_int(f)
+        pk_indexes = None
+        if protocol_version >= 4:
+            num_pk_indexes = read_int(f)
+            pk_indexes = [read_short(f) for _ in range(num_pk_indexes)]
+
+        if glob_tblspec:
+            ksname = read_string(f)
+            cfname = read_string(f)
+        column_metadata = []
+        for _ in range(colcount):
+            if glob_tblspec:
+                colksname = ksname
+                colcfname = cfname
+            else:
+                colksname = read_string(f)
+                colcfname = read_string(f)
+            colname = read_string(f)
+            coltype = cls.read_type(f, user_type_map)
+            column_metadata.append(ColumnMetadata(colksname, colcfname, colname, coltype))
+        return column_metadata, pk_indexes
+
+    @classmethod
     def recv_results_schema_change(cls, f, protocol_version):
         return EventMessage.recv_schema_change(f, protocol_version)
 
@@ -619,7 +671,7 @@ class ResultMessage(_MessageType):
     def read_type(cls, f, user_type_map):
         optid = read_short(f)
         try:
-            typeclass = cls._type_codes[optid]
+            typeclass = cls.type_codes[optid]
         except KeyError:
             raise NotSupportedError("Unknown data type code 0x%04x. Have to skip"
                                     " entire result set." % (optid,))
@@ -638,11 +690,11 @@ class ResultMessage(_MessageType):
             ks = read_string(f)
             udt_name = read_string(f)
             num_fields = read_short(f)
-            names_and_types = tuple((read_string(f), cls.read_type(f, user_type_map))
-                                    for _ in range(num_fields))
-            mapped_class = user_type_map.get(ks, {}).get(udt_name)
-            typeclass = typeclass.make_udt_class(
-                ks, udt_name, names_and_types, mapped_class)
+            names, types = zip(*((read_string(f), cls.read_type(f, user_type_map))
+                                 for _ in range(num_fields)))
+            specialized_type = typeclass.make_udt_class(ks, udt_name, names, types)
+            specialized_type.mapped_class = user_type_map.get(ks, {}).get(udt_name)
+            typeclass = specialized_type
         elif typeclass == CUSTOM_TYPE:
             classname = read_string(f)
             typeclass = lookup_casstype(classname)
@@ -823,24 +875,199 @@ class EventMessage(_MessageType):
         if protocol_version >= 3:
             target = read_string(f)
             keyspace = read_string(f)
-            if target != "KEYSPACE":
-                table_or_type = read_string(f)
-                return {'change_type': change_type, 'keyspace': keyspace, target.lower(): table_or_type}
-            else:
-                return {'change_type': change_type, 'keyspace': keyspace}
+            event = {'target_type': target, 'change_type': change_type, 'keyspace': keyspace}
+            if target != SchemaTargetType.KEYSPACE:
+                target_name = read_string(f)
+                if target == SchemaTargetType.FUNCTION:
+                    event['function'] = UserFunctionDescriptor(target_name, [read_string(f) for _ in range(read_short(f))])
+                elif target == SchemaTargetType.AGGREGATE:
+                    event['aggregate'] = UserAggregateDescriptor(target_name, [read_string(f) for _ in range(read_short(f))])
+                else:
+                    event[target.lower()] = target_name
         else:
             keyspace = read_string(f)
             table = read_string(f)
-            return {'change_type': change_type, 'keyspace': keyspace, 'table': table}
+            if table:
+                event = {'target_type': SchemaTargetType.TABLE, 'change_type': change_type, 'keyspace': keyspace, 'table': table}
+            else:
+                event = {'target_type': SchemaTargetType.KEYSPACE, 'change_type': change_type, 'keyspace': keyspace}
+        return event
 
 
-def write_header(f, version, flags, stream_id, opcode, length):
+class _ProtocolHandler(object):
     """
-    Write a CQL protocol frame header.
+    _ProtocolHander handles encoding and decoding messages.
+
+    This class can be specialized to compose Handlers which implement alternative
+    result decoding or type deserialization. Class definitions are passed to :class:`cassandra.cluster.Cluster`
+    on initialization.
+
+    Contracted class methods are :meth:`_ProtocolHandler.encode_message` and :meth:`_ProtocolHandler.decode_message`.
     """
-    pack = v3_header_pack if version >= 3 else header_pack
-    f.write(pack(version | HEADER_DIRECTION_FROM_CLIENT, flags, stream_id, opcode))
-    write_int(f, length)
+
+    message_types_by_opcode = _message_types_by_opcode.copy()
+    """
+    Default mapping of opcode to Message implementation. The default ``decode_message`` implementation uses
+    this to instantiate a message and populate using ``recv_body``. This mapping can be updated to inject specialized
+    result decoding implementations.
+    """
+
+    @classmethod
+    def encode_message(cls, msg, stream_id, protocol_version, compressor):
+        """
+        Encodes a message using the specified frame parameters, and compressor
+
+        :param msg: the message, typically of cassandra.protocol._MessageType, generated by the driver
+        :param stream_id: protocol stream id for the frame header
+        :param protocol_version: version for the frame header, and used encoding contents
+        :param compressor: optional compression function to be used on the body
+        """
+        flags = 0
+        body = io.BytesIO()
+        if msg.custom_payload:
+            if protocol_version < 4:
+                raise UnsupportedOperation("Custom key/value payloads can only be used with protocol version 4 or higher")
+            flags |= CUSTOM_PAYLOAD_FLAG
+            write_bytesmap(body, msg.custom_payload)
+        msg.send_body(body, protocol_version)
+        body = body.getvalue()
+
+        if compressor and len(body) > 0:
+            body = compressor(body)
+            flags |= COMPRESSED_FLAG
+
+        if msg.tracing:
+            flags |= TRACING_FLAG
+
+        buff = io.BytesIO()
+        cls._write_header(buff, protocol_version, flags, stream_id, msg.opcode, len(body))
+        buff.write(body)
+
+        return buff.getvalue()
+
+    @staticmethod
+    def _write_header(f, version, flags, stream_id, opcode, length):
+        """
+        Write a CQL protocol frame header.
+        """
+        pack = v3_header_pack if version >= 3 else header_pack
+        f.write(pack(version, flags, stream_id, opcode))
+        write_int(f, length)
+
+    @classmethod
+    def decode_message(cls, protocol_version, user_type_map, stream_id, flags, opcode, body,
+                       decompressor):
+        """
+        Decodes a native protocol message body
+
+        :param protocol_version: version to use decoding contents
+        :param user_type_map: map[keyspace name] = map[type name] = custom type to instantiate when deserializing this type
+        :param stream_id: native protocol stream id from the frame header
+        :param flags: native protocol flags bitmap from the header
+        :param opcode: native protocol opcode from the header
+        :param body: frame body
+        :param decompressor: optional decompression function to inflate the body
+        :return: a message decoded from the body and frame attributes
+        """
+        if flags & COMPRESSED_FLAG:
+            if decompressor is None:
+                raise Exception("No de-compressor available for compressed frame!")
+            body = decompressor(body)
+            flags ^= COMPRESSED_FLAG
+
+        body = io.BytesIO(body)
+        if flags & TRACING_FLAG:
+            trace_id = UUID(bytes=body.read(16))
+            flags ^= TRACING_FLAG
+        else:
+            trace_id = None
+
+        if flags & WARNING_FLAG:
+            warnings = read_stringlist(body)
+            flags ^= WARNING_FLAG
+        else:
+            warnings = None
+
+        if flags & CUSTOM_PAYLOAD_FLAG:
+            custom_payload = read_bytesmap(body)
+            flags ^= CUSTOM_PAYLOAD_FLAG
+        else:
+            custom_payload = None
+
+        if flags:
+            log.warning("Unknown protocol flags set: %02x. May cause problems.", flags)
+
+        msg_class = cls.message_types_by_opcode[opcode]
+        msg = msg_class.recv_body(body, protocol_version, user_type_map)
+        msg.stream_id = stream_id
+        msg.trace_id = trace_id
+        msg.custom_payload = custom_payload
+        msg.warnings = warnings
+
+        if msg.warnings:
+            for w in msg.warnings:
+                log.warning("Server warning: %s", w)
+
+        return msg
+
+def cython_protocol_handler(colparser):
+    """
+    Given a column parser to deserialize ResultMessages, return a suitable
+    Cython-based protocol handler.
+
+    There are three Cython-based protocol handlers:
+
+        - obj_parser.ListParser
+            decodes result messages into a list of tuples
+
+        - obj_parser.LazyParser
+            decodes result messages lazily by returning an iterator
+
+        - numpy_parser.NumPyParser
+            decodes result messages into NumPy arrays
+
+    The default is to use obj_parser.ListParser
+    """
+    from cassandra.row_parser import make_recv_results_rows
+
+    class FastResultMessage(ResultMessage):
+        """
+        Cython version of Result Message that has a faster implementation of
+        recv_results_row.
+        """
+        # type_codes = ResultMessage.type_codes.copy()
+        code_to_type = dict((v, k) for k, v in ResultMessage.type_codes.items())
+        recv_results_rows = classmethod(make_recv_results_rows(colparser))
+
+    class CythonProtocolHandler(_ProtocolHandler):
+        """
+        Use FastResultMessage to decode query result message messages.
+        """
+
+        my_opcodes = _ProtocolHandler.message_types_by_opcode.copy()
+        my_opcodes[FastResultMessage.opcode] = FastResultMessage
+        message_types_by_opcode = my_opcodes
+
+        col_parser = colparser
+
+    return CythonProtocolHandler
+
+
+if HAVE_CYTHON:
+    from cassandra.obj_parser import ListParser, LazyParser
+    ProtocolHandler = cython_protocol_handler(ListParser())
+    LazyProtocolHandler = cython_protocol_handler(LazyParser())
+else:
+    # Use Python-based ProtocolHandler
+    ProtocolHandler = _ProtocolHandler
+    LazyProtocolHandler = None
+
+
+if HAVE_CYTHON and HAVE_NUMPY:
+    from cassandra.numpy_parser import NumpyParser
+    NumpyProtocolHandler = cython_protocol_handler(NumpyParser())
+else:
+    NumpyProtocolHandler = None
 
 
 def read_byte(f):
@@ -942,6 +1169,22 @@ def write_stringmap(f, strmap):
         write_string(f, v)
 
 
+def read_bytesmap(f):
+    numpairs = read_short(f)
+    bytesmap = {}
+    for _ in range(numpairs):
+        k = read_string(f)
+        bytesmap[k] = read_value(f)
+    return bytesmap
+
+
+def write_bytesmap(f, bytesmap):
+    write_short(f, len(bytesmap))
+    for k, v in bytesmap.items():
+        write_string(f, k)
+        write_value(f, v)
+
+
 def read_stringmultimap(f):
     numkeys = read_short(f)
     strmmap = {}
@@ -968,6 +1211,8 @@ def read_value(f):
 def write_value(f, v):
     if v is None:
         write_int(f, -1)
+    elif v is _UNSET_VALUE:
+        write_int(f, -2)
     else:
         write_int(f, len(v))
         f.write(v)
@@ -983,7 +1228,7 @@ def read_inet(f):
         addrfam = socket.AF_INET6
     else:
         raise InternalError("bad inet address: %r" % (addrbytes,))
-    return (socket.inet_ntop(addrfam, addrbytes), port)
+    return (util.inet_ntop(addrfam, addrbytes), port)
 
 
 def write_inet(f, addrtuple):
@@ -992,7 +1237,7 @@ def write_inet(f, addrtuple):
         addrfam = socket.AF_INET6
     else:
         addrfam = socket.AF_INET
-    addrbytes = socket.inet_pton(addrfam, addr)
+    addrbytes = util.inet_pton(addrfam, addr)
     write_byte(f, len(addrbytes))
     f.write(addrbytes)
     write_int(f, port)
