@@ -1,14 +1,8 @@
-python-cassandra-driver (3.1.1-0tcp2) jessie; urgency=medium
-
-  * Fix priority
-
- -- Filip Pytloun <filip@pytloun.cz>  Tue, 22 Mar 2016 17:02:37 +0100
-
-python-cassandra-driver (3.1.1-0tcp1) jessie; urgency=medium
+python-cassandra-driver (3.1.1-0.1) unstable; urgency=medium
 
   * New upstream version
 
- -- Jiri Konecny <jiri.konecny@tcpcloud.eu>  Tue, 22 Mar 2016 15:22:00 +0100
+ -- Filip Pytloun <filip@pytloun.cz>  Tue, 22 Mar 2016 17:02:37 +0100
 
 python-cassandra-driver (2.5.1-1) unstable; urgency=low
 
