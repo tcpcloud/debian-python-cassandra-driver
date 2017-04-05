@@ -4,16 +4,17 @@ Priority: optional
 Maintainer: tcpcloud Packaging Team <pkg@tcpcloud.eu>
 XSBC-Original-Maintainer: Sandro Tosi <morph@debian.org>
 Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.org>
-Build-Depends: debhelper (>= 9), python, python3, python-setuptools, python3-setuptools
+Build-Depends: debhelper (>= 9), python, python3, python-dev, python3-dev, python-setuptools, python3-setuptools
 Standards-Version: 3.9.6
 Homepage: https://github.com/datastax/python-driver
 Vcs-Git: git://anonscm.debian.org/python-modules/packages/python-cassandra-driver.git
 Vcs-Browser: http://anonscm.debian.org/cgit/python-modules/packages/python-cassandra-driver.git
 
-Package: python-cassandra-driver
+Package: python-cassandra
 Architecture: all
 Depends: ${python:Depends}, ${misc:Depends}
 Suggests: python-snappy, python-lz4, python-blist
+Provides: python-cassandra-driver
 Description: Python driver for Apache Cassandra
  A modern, feature-rich and highly-tunable Python client library for Apache
  Cassandra (1.2+) and DataStax Enterprise (3.1+) using exclusively Cassandra's
