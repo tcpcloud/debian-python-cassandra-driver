@@ -7,6 +7,7 @@ Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.o
 Build-Depends: cython,
                cython3,
                debhelper (>= 9),
+               libev-dev,
                python,
                python-dev,
                python-setuptools,
