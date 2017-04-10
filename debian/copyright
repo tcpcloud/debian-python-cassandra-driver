@@ -3,7 +3,7 @@ Upstream-Name: cassandra-driver
 Source: https://github.com/datastax/python-driver
 
 Files: *
-Copyright: Copyright 2013-2015 DataStax
+Copyright: Copyright 2013-2016 DataStax
 License: Apache-2
 
 License: Apache-2
@@ -23,7 +23,7 @@ License: Apache-2
  can be found in /usr/share/common-licenses/Apache-2.0.
 
 Files: debian/*
-Copyright: 2015 Sandro Tosi <morph@debian.org>
+Copyright: 2015-2017 Sandro Tosi <morph@debian.org>
 License: Apache-2
 
 Files: cassandra/util.py
@@ -57,7 +57,7 @@ License: Apache-2
 Files: cassandra/murmur3.c
 Copyright: Copyright (c) 2011 Austin Appleby (Murmur3 routine)
  Copyright (c) 2011 Patrick Hensley (Python wrapper, packaging)
- Copyright 2013 DataStax (Minor modifications to match Cassandra's MM3 hashes)
+ Copyright 2013-2016 DataStax (Minor modifications to match Cassandra's MM3 hashes)
 License: MIT
 Note: The majority of this code was taken from the python-smhasher library,
  which can be found here: https://github.com/phensley/python-smhasher

@@ -1,0 +1,11 @@
+# see git-dpm(1) from git-dpm package
+644f3e0beeaeab28d8c94dbf9a777c7c84b4fefb
+644f3e0beeaeab28d8c94dbf9a777c7c84b4fefb
+644f3e0beeaeab28d8c94dbf9a777c7c84b4fefb
+644f3e0beeaeab28d8c94dbf9a777c7c84b4fefb
+python-cassandra-driver_3.7.1.orig.tar.gz
+ca29d797200e4d384f8b98a69f9502936e75d0ec
+211782
+debianTag="debian/%e%v"
+patchedTag="patched/%e%v"
+upstreamTag="upstream/%e%u"

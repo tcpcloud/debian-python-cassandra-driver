@@ -22,8 +22,7 @@ class NullHandler(logging.Handler):
 
 logging.getLogger('cassandra').addHandler(NullHandler())
 
-
-__version_info__ = (3, 1, 1)
+__version_info__ = (3, 7, 1)
 __version__ = '.'.join(map(str, __version_info__))
 
 
@@ -195,7 +194,21 @@ class UserAggregateDescriptor(SignatureDescriptor):
     """
 
 
-class Unavailable(Exception):
+class DriverException(Exception):
+    """
+    Base for all exceptions explicitly raised by the driver.
+    """
+    pass
+
+
+class RequestExecutionException(DriverException):
+    """
+    Base for request execution exceptions returned from the server.
+    """
+    pass
+
+
+class Unavailable(RequestExecutionException):
     """
     There were not enough live replicas to satisfy the requested consistency
     level, so the coordinator node immediately failed the request without
@@ -221,7 +234,7 @@ class Unavailable(Exception):
                                  'alive_replicas': alive_replicas}))
 
 
-class Timeout(Exception):
+class Timeout(RequestExecutionException):
     """
     Replicas failed to respond to the coordinator node before timing out.
     """
@@ -290,7 +303,7 @@ class WriteTimeout(Timeout):
         self.write_type = write_type
 
 
-class CoordinationFailure(Exception):
+class CoordinationFailure(RequestExecutionException):
     """
     Replicas sent a failure to the coordinator.
     """
@@ -312,16 +325,34 @@ class CoordinationFailure(Exception):
     The number of replicas that sent a failure message
     """
 
-    def __init__(self, summary_message, consistency=None, required_responses=None, received_responses=None, failures=None):
+    error_code_map = None
+    """
+    A map of inet addresses to error codes representing replicas that sent
+    a failure message.  Only set when `protocol_version` is 5 or higher.
+    """
+
+    def __init__(self, summary_message, consistency=None, required_responses=None,
+                 received_responses=None, failures=None, error_code_map=None):
         self.consistency = consistency
         self.required_responses = required_responses
         self.received_responses = received_responses
         self.failures = failures
-        Exception.__init__(self, summary_message + ' info=' +
-                           repr({'consistency': consistency_value_to_name(consistency),
-                                 'required_responses': required_responses,
-                                 'received_responses': received_responses,
-                                 'failures': failures}))
+        self.error_code_map = error_code_map
+
+        info_dict = {
+            'consistency': consistency_value_to_name(consistency),
+            'required_responses': required_responses,
+            'received_responses': received_responses,
+            'failures': failures
+        }
+
+        if error_code_map is not None:
+            # make error codes look like "0x002a"
+            formatted_map = dict((addr, '0x%04x' % err_code)
+                                 for (addr, err_code) in error_code_map.items())
+            info_dict['error_code_map'] = formatted_map
+
+        Exception.__init__(self, summary_message + ' info=' + repr(info_dict))
 
 
 class ReadFailure(CoordinationFailure):
@@ -360,7 +391,7 @@ class WriteFailure(CoordinationFailure):
         self.write_type = write_type
 
 
-class FunctionFailure(Exception):
+class FunctionFailure(RequestExecutionException):
     """
     User Defined Function failed during execution
     """
@@ -387,7 +418,21 @@ class FunctionFailure(Exception):
         Exception.__init__(self, summary_message)
 
 
-class AlreadyExists(Exception):
+class RequestValidationException(DriverException):
+    """
+    Server request validation failed
+    """
+    pass
+
+
+class ConfigurationException(RequestValidationException):
+    """
+    Server indicated request errro due to current configuration
+    """
+    pass
+
+
+class AlreadyExists(ConfigurationException):
     """
     An attempt was made to create a keyspace or table that already exists.
     """
@@ -415,7 +460,7 @@ class AlreadyExists(Exception):
         self.table = table
 
 
-class InvalidRequest(Exception):
+class InvalidRequest(RequestValidationException):
     """
     A query was made that was invalid for some reason, such as trying to set
     the keyspace for a connection to a nonexistent keyspace.
@@ -423,21 +468,21 @@ class InvalidRequest(Exception):
     pass
 
 
-class Unauthorized(Exception):
+class Unauthorized(RequestValidationException):
     """
-    The current user is not authorized to perfom the requested operation.
+    The current user is not authorized to perform the requested operation.
     """
     pass
 
 
-class AuthenticationFailed(Exception):
+class AuthenticationFailed(DriverException):
     """
     Failed to authenticate.
     """
     pass
 
 
-class OperationTimedOut(Exception):
+class OperationTimedOut(DriverException):
     """
     The operation took longer than the specified (client-side) timeout
     to complete.  This is not an error generated by Cassandra, only
@@ -461,7 +506,7 @@ class OperationTimedOut(Exception):
         Exception.__init__(self, message)
 
 
-class UnsupportedOperation(Exception):
+class UnsupportedOperation(DriverException):
     """
     An attempt was made to use a feature that is not supported by the
     selected protocol version.  See :attr:`Cluster.protocol_version`

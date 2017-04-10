@@ -1,29 +1,18 @@
 Source: python-cassandra-driver
 Section: python
 Priority: optional
-Maintainer: tcpcloud Packaging Team <pkg@tcpcloud.eu>
-XSBC-Original-Maintainer: Sandro Tosi <morph@debian.org>
+Maintainer: Sandro Tosi <morph@debian.org>
 Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.org>
-Build-Depends: cython,
-               cython3,
-               debhelper (>= 9),
-               libev-dev,
-               python,
-               python-dev,
-               python-setuptools,
-               python3,
-               python3-dev,
-               python3-setuptools
-Standards-Version: 3.9.6
+Build-Depends: debhelper (>= 10), python-all-dev, python3-all-dev, python-all-dbg, python3-all-dbg, python-setuptools, python3-setuptools, libev-dev, cython, cython3, dh-python
+Standards-Version: 3.9.8
 Homepage: https://github.com/datastax/python-driver
-Vcs-Git: git://anonscm.debian.org/python-modules/packages/python-cassandra-driver.git
-Vcs-Browser: http://anonscm.debian.org/cgit/python-modules/packages/python-cassandra-driver.git
+Vcs-Git: https://anonscm.debian.org/git/python-modules/packages/python-cassandra-driver.git
+Vcs-Browser: https://anonscm.debian.org/cgit/python-modules/packages/python-cassandra-driver.git
 
 Package: python-cassandra
-Architecture: all
-Depends: ${misc:Depends}, ${python:Depends}
-Suggests: python-blist, python-lz4, python-snappy
-Provides: python-cassandra-driver
+Architecture: any
+Depends: ${python:Depends}, ${misc:Depends}, ${shlibs:Depends}
+Suggests: python-snappy, python-lz4, python-blist
 Description: Python driver for Apache Cassandra
  A modern, feature-rich and highly-tunable Python client library for Apache
  Cassandra (1.2+) and DataStax Enterprise (3.1+) using exclusively Cassandra's
@@ -40,9 +29,33 @@ Description: Python driver for Apache Cassandra
   * Concurrent execution utilities
   * Object mapper
 
+Package: python-cassandra-dbg
+Section: debug
+Priority: extra
+Architecture: amd64 arm64 armel armhf hurd-i386 i386 kfreebsd-amd64 kfreebsd-i386 mips64el mipsel ppc64el
+Depends: ${python:Depends}, ${misc:Depends}, ${shlibs:Depends}, python-cassandra (= ${binary:Version}),
+Suggests: python-snappy, python-lz4, python-blist
+Description: Python driver for Apache Cassandra (debug)
+ A modern, feature-rich and highly-tunable Python client library for Apache
+ Cassandra (1.2+) and DataStax Enterprise (3.1+) using exclusively Cassandra's
+ binary protocol and Cassandra Query Language v3.
+ .
+ Features:
+  * Synchronous and Asynchronous APIs
+  * Simple, Prepared, and Batch statements
+  * Asynchronous IO, parallel execution, request pipelining
+  * Connection pooling
+  * Automatic node discovery
+  * Automatic reconnection
+  * Configurable load balancing and retry policies
+  * Concurrent execution utilities
+  * Object mapper
+ .
+ This package contains the debug extension for python-cassandra
+
 Package: python3-cassandra
-Architecture: all
-Depends: ${misc:Depends}, ${python3:Depends}
+Architecture: any
+Depends: ${python3:Depends}, ${misc:Depends}, ${shlibs:Depends}
 Suggests: python3-blist
 Description: Python driver for Apache Cassandra (Python 3)
  A modern, feature-rich and highly-tunable Python client library for Apache
@@ -61,3 +74,27 @@ Description: Python driver for Apache Cassandra (Python 3)
   * Object mapper
  .
  This package contains the Python 3.x module for python-cassandra
+
+Package: python3-cassandra-dbg
+Section: debug
+Priority: extra
+Architecture: amd64 arm64 armel armhf hurd-i386 i386 kfreebsd-amd64 kfreebsd-i386 mips64el mipsel ppc64el
+Depends: ${python3:Depends}, ${misc:Depends}, ${shlibs:Depends}, python3-cassandra (= ${binary:Version})
+Suggests: python3-blist
+Description: Python driver for Apache Cassandra (Python 3 debug)
+ A modern, feature-rich and highly-tunable Python client library for Apache
+ Cassandra (1.2+) and DataStax Enterprise (3.1+) using exclusively Cassandra's
+ binary protocol and Cassandra Query Language v3.
+ .
+ Features:
+  * Synchronous and Asynchronous APIs
+  * Simple, Prepared, and Batch statements
+  * Asynchronous IO, parallel execution, request pipelining
+  * Connection pooling
+  * Automatic node discovery
+  * Automatic reconnection
+  * Configurable load balancing and retry policies
+  * Concurrent execution utilities
+  * Object mapper
+ .
+ This package contains the debug extensions for python3-cassandra

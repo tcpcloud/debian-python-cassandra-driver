@@ -77,6 +77,7 @@ def trim_if_startswith(s, prefix):
 
 
 _casstypes = {}
+_cqltypes = {}
 
 
 cql_type_scanner = re.Scanner((
@@ -106,6 +107,8 @@ class CassandraTypeType(type):
         cls = type.__new__(metacls, name, bases, dct)
         if not name.startswith('_'):
             _casstypes[name] = cls
+            if not cls.typename.startswith(apache_cassandra_type_prefix):
+                _cqltypes[cls.typename] = cls
         return cls
 
 
@@ -620,6 +623,11 @@ class SimpleDateType(_CassandraType):
         try:
             days = val.days_from_epoch
         except AttributeError:
+            if isinstance(val, six.integer_types):
+                # the DB wants offset int values, but util.Date init takes days from epoch
+                # here we assume int values are offset, as they would appear in CQL
+                # short circuit to avoid subtracting just to add offset
+                return uint32_pack(val)
             days = util.Date(val).days_from_epoch
         return uint32_pack(days + SimpleDateType.EPOCH_OFFSET_DAYS)
 
@@ -674,6 +682,8 @@ class VarcharType(UTF8Type):
 
 
 class _ParameterizedType(_CassandraType):
+    num_subtypes = 'UNKNOWN'
+
     @classmethod
     def deserialize(cls, byts, protocol_version):
         if not cls.subtypes:
@@ -794,7 +804,6 @@ class MapType(_ParameterizedType):
 
 class TupleType(_ParameterizedType):
     typename = 'tuple'
-    num_subtypes = 'UNKNOWN'
 
     @classmethod
     def deserialize_safe(cls, byts, protocol_version):
@@ -845,7 +854,7 @@ class TupleType(_ParameterizedType):
 
 
 class UserType(TupleType):
-    typename = "'org.apache.cassandra.db.marshal.UserType'"
+    typename = "org.apache.cassandra.db.marshal.UserType"
 
     _cache = {}
     _module = sys.modules[__name__]
@@ -948,8 +957,7 @@ class UserType(TupleType):
 
 
 class CompositeType(_ParameterizedType):
-    typename = "'org.apache.cassandra.db.marshal.CompositeType'"
-    num_subtypes = 'UNKNOWN'
+    typename = "org.apache.cassandra.db.marshal.CompositeType"
 
     @classmethod
     def cql_parameterized_type(cls):
@@ -977,8 +985,13 @@ class CompositeType(_ParameterizedType):
         return tuple(result)
 
 
-class DynamicCompositeType(CompositeType):
-    typename = "'org.apache.cassandra.db.marshal.DynamicCompositeType'"
+class DynamicCompositeType(_ParameterizedType):
+    typename = "org.apache.cassandra.db.marshal.DynamicCompositeType"
+
+    @classmethod
+    def cql_parameterized_type(cls):
+        sublist = ', '.join('%s=>%s' % (alias, typ.cass_parameterized_type(full=True)) for alias, typ in zip(cls.fieldnames, cls.subtypes))
+        return "'%s(%s)'" % (cls.typename, sublist)
 
 
 class ColumnToCollectionType(_ParameterizedType):
@@ -987,12 +1000,11 @@ class ColumnToCollectionType(_ParameterizedType):
     Cassandra includes this. We don't actually need or want the extra
     information.
     """
-    typename = "'org.apache.cassandra.db.marshal.ColumnToCollectionType'"
-    num_subtypes = 'UNKNOWN'
+    typename = "org.apache.cassandra.db.marshal.ColumnToCollectionType"
 
 
 class ReversedType(_ParameterizedType):
-    typename = "'org.apache.cassandra.db.marshal.ReversedType'"
+    typename = "org.apache.cassandra.db.marshal.ReversedType"
     num_subtypes = 1
 
     @classmethod

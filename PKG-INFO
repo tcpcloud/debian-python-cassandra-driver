@@ -1,6 +1,6 @@
 Metadata-Version: 1.1
 Name: cassandra-driver
-Version: 3.1.1
+Version: 3.7.1
 Summary: Python driver for Cassandra
 Home-page: http://github.com/datastax/python-driver
 Author: Tyler Hobbs
@@ -77,10 +77,6 @@ Description: DataStax Python Driver for Apache Cassandra
         
         For IRC, use the #datastax-drivers channel on irc.freenode.net.  If you don't have an IRC client,
         you can use `freenode's web-based client <http://webchat.freenode.net/?channels=#datastax-drivers>`_.
-        
-        Features to be Added
-        --------------------
-        * C extension for encoding/decoding messages
         
         License
         -------
