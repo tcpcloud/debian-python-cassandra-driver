@@ -1,3 +1,9 @@
+python-cassandra-driver (3.7.1-2.1mirantis) xenial; urgency=medium
+
+  * python-cassandra provides python-cassandra-driver
+
+ -- chnyda <chnyda@mirantis.com>  Wed, 07 Jun 2017 15:09:03 +0200
+
 python-cassandra-driver (3.7.1-2.1) unstable; urgency=medium
 
   * Non-maintainer upload.
