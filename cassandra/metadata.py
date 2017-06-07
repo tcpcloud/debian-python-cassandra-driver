@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from binascii import unhexlify
 from bisect import bisect_right
 from collections import defaultdict, Mapping
 from hashlib import md5
@@ -117,30 +118,32 @@ class Metadata(object):
 
     def refresh(self, connection, timeout, target_type=None, change_type=None, **kwargs):
 
+        server_version = self.get_host(connection.host).release_version
+        parser = get_schema_parser(connection, server_version, timeout)
+
         if not target_type:
-            self._rebuild_all(connection, timeout)
+            self._rebuild_all(parser)
             return
 
         tt_lower = target_type.lower()
         try:
-            parser = get_schema_parser(connection, timeout)
             parse_method = getattr(parser, 'get_' + tt_lower)
             meta = parse_method(self.keyspaces, **kwargs)
             if meta:
                 update_method = getattr(self, '_update_' + tt_lower)
-                update_method(meta)
+                if tt_lower == 'keyspace' and connection.protocol_version < 3:
+                    # we didn't have 'type' target in legacy protocol versions, so we need to query those too
+                    user_types = parser.get_types_map(self.keyspaces, **kwargs)
+                    self._update_keyspace(meta, user_types)
+                else:
+                    update_method(meta)
             else:
                 drop_method = getattr(self, '_drop_' + tt_lower)
                 drop_method(**kwargs)
         except AttributeError:
             raise ValueError("Unknown schema target_type: '%s'" % target_type)
 
-    def _rebuild_all(self, connection, timeout):
-        """
-        For internal use only.
-        """
-        parser = get_schema_parser(connection, timeout)
-
+    def _rebuild_all(self, parser):
         current_keyspaces = set()
         for keyspace_meta in parser.get_all_keyspaces():
             current_keyspaces.add(keyspace_meta.name)
@@ -159,13 +162,13 @@ class Metadata(object):
         for ksname in removed_keyspaces:
             self._keyspace_removed(ksname)
 
-    def _update_keyspace(self, keyspace_meta):
+    def _update_keyspace(self, keyspace_meta, new_user_types=None):
         ks_name = keyspace_meta.name
         old_keyspace_meta = self.keyspaces.get(ks_name, None)
         self.keyspaces[ks_name] = keyspace_meta
         if old_keyspace_meta:
             keyspace_meta.tables = old_keyspace_meta.tables
-            keyspace_meta.user_types = old_keyspace_meta.user_types
+            keyspace_meta.user_types = new_user_types if new_user_types is not None else old_keyspace_meta.user_types
             keyspace_meta.indexes = old_keyspace_meta.indexes
             keyspace_meta.functions = old_keyspace_meta.functions
             keyspace_meta.aggregates = old_keyspace_meta.aggregates
@@ -274,7 +277,7 @@ class Metadata(object):
         ring = []
         for host, token_strings in six.iteritems(token_map):
             for token_string in token_strings:
-                token = token_class(token_string)
+                token = token_class.from_string(token_string)
                 ring.append(token)
                 token_to_host_owner[token] = host
 
@@ -326,7 +329,7 @@ class Metadata(object):
         Returns a list of all known :class:`.Host` instances in the cluster.
         """
         with self._hosts_lock:
-            return self._hosts.values()
+            return list(self._hosts.values())
 
 
 REPLICATION_STRATEGY_CLASS_PREFIX = "org.apache.cassandra.locator."
@@ -471,8 +474,6 @@ class NetworkTopologyStrategy(ReplicationStrategy):
             (str(k), int(v)) for k, v in dc_replication_factors.items())
 
     def make_token_replica_map(self, token_to_host_owner, ring):
-        # note: this does not account for hosts having different racks
-        replica_map = defaultdict(list)
         dc_rf_map = dict((dc, int(rf))
                          for dc, rf in self.dc_replication_factors.items() if rf > 0)
 
@@ -480,16 +481,19 @@ class NetworkTopologyStrategy(ReplicationStrategy):
         # belong to that DC
         dc_to_token_offset = defaultdict(list)
         dc_racks = defaultdict(set)
+        hosts_per_dc = defaultdict(set)
         for i, token in enumerate(ring):
             host = token_to_host_owner[token]
             dc_to_token_offset[host.datacenter].append(i)
             if host.datacenter and host.rack:
                 dc_racks[host.datacenter].add(host.rack)
+                hosts_per_dc[host.datacenter].add(host)
 
         # A map of DCs to an index into the dc_to_token_offset value for that dc.
         # This is how we keep track of advancing around the ring for each DC.
         dc_to_current_index = defaultdict(int)
 
+        replica_map = defaultdict(list)
         for i in range(len(ring)):
             replicas = replica_map[ring[i]]
 
@@ -508,12 +512,14 @@ class NetworkTopologyStrategy(ReplicationStrategy):
                 dc_to_current_index[dc] = index
 
                 replicas_remaining = dc_rf_map[dc]
+                replicas_this_dc = 0
                 skipped_hosts = []
                 racks_placed = set()
                 racks_this_dc = dc_racks[dc]
+                hosts_this_dc = len(hosts_per_dc[dc])
                 for token_offset in islice(cycle(token_offsets), index, index + num_tokens):
                     host = token_to_host_owner[ring[token_offset]]
-                    if replicas_remaining == 0:
+                    if replicas_remaining == 0 or replicas_this_dc == hosts_this_dc:
                         break
 
                     if host in replicas:
@@ -524,6 +530,7 @@ class NetworkTopologyStrategy(ReplicationStrategy):
                         continue
 
                     replicas.append(host)
+                    replicas_this_dc += 1
                     replicas_remaining -= 1
                     racks_placed.add(host.rack)
 
@@ -1060,14 +1067,11 @@ class TableMetadata(object):
         """
         comparator = getattr(self, 'comparator', None)
         if comparator:
-            # no such thing as DCT in CQL
-            incompatible = issubclass(self.comparator, types.DynamicCompositeType)
-
             # no compact storage with more than one column beyond PK if there
             # are clustering columns
-            incompatible |= (self.is_compact_storage and
-                             len(self.columns) > len(self.primary_key) + 1 and
-                             len(self.clustering_key) >= 1)
+            incompatible = (self.is_compact_storage and
+                            len(self.columns) > len(self.primary_key) + 1 and
+                            len(self.clustering_key) >= 1)
 
             return not incompatible
         return True
@@ -1221,14 +1225,8 @@ class TableMetadata(object):
         return list(sorted(ret))
 
 
-if six.PY3:
-    def protect_name(name):
-        return maybe_escape_name(name)
-else:
-    def protect_name(name):  # NOQA
-        if isinstance(name, six.text_type):
-            name = name.encode('utf8')
-        return maybe_escape_name(name)
+def protect_name(name):
+    return maybe_escape_name(name)
 
 
 def protect_names(names):
@@ -1400,10 +1398,18 @@ class TokenMap(object):
 
     def rebuild_keyspace(self, keyspace, build_if_absent=False):
         with self._rebuild_lock:
-            current = self.tokens_to_hosts_by_ks.get(keyspace, None)
-            if (build_if_absent and current is None) or (not build_if_absent and current is not None):
-                replica_map = self.replica_map_for_keyspace(self._metadata.keyspaces[keyspace])
-                self.tokens_to_hosts_by_ks[keyspace] = replica_map
+            try:
+                current = self.tokens_to_hosts_by_ks.get(keyspace, None)
+                if (build_if_absent and current is None) or (not build_if_absent and current is not None):
+                    ks_meta = self._metadata.keyspaces.get(keyspace)
+                    if ks_meta:
+                        replica_map = self.replica_map_for_keyspace(self._metadata.keyspaces[keyspace])
+                        self.tokens_to_hosts_by_ks[keyspace] = replica_map
+            except Exception:
+                # should not happen normally, but we don't want to blow up queries because of unexpected meta state
+                # bypass until new map is generated
+                self.tokens_to_hosts_by_ks[keyspace] = {}
+                log.exception("Failed creating a token map for keyspace '%s' with %s. PLEASE REPORT THIS: https://datastax-oss.atlassian.net/projects/PYTHON", keyspace, self.token_to_host_owner)
 
     def replica_map_for_keyspace(self, ks_metadata):
         strategy = ks_metadata.replication_strategy
@@ -1442,6 +1448,9 @@ class Token(object):
     Abstract class representing a token.
     """
 
+    def __init__(self, token):
+        self.value = token
+
     @classmethod
     def hash_fn(cls, key):
         return key
@@ -1449,6 +1458,10 @@ class Token(object):
     @classmethod
     def from_key(cls, key):
         return cls(cls.hash_fn(key))
+
+    @classmethod
+    def from_string(cls, token_string):
+        raise NotImplementedError()
 
     def __cmp__(self, other):
         if self.value < other.value:
@@ -1479,7 +1492,16 @@ class NoMurmur3(Exception):
     pass
 
 
-class Murmur3Token(Token):
+class HashToken(Token):
+
+    @classmethod
+    def from_string(cls, token_string):
+        """ `token_string` should be the string representation from the server. """
+        # The hash partitioners just store the deciman value
+        return cls(int(token_string))
+
+
+class Murmur3Token(HashToken):
     """
     A token for ``Murmur3Partitioner``.
     """
@@ -1493,11 +1515,11 @@ class Murmur3Token(Token):
             raise NoMurmur3()
 
     def __init__(self, token):
-        """ `token` should be an int or string representing the token. """
+        """ `token` is an int or string representing the token. """
         self.value = int(token)
 
 
-class MD5Token(Token):
+class MD5Token(HashToken):
     """
     A token for ``RandomPartitioner``.
     """
@@ -1508,23 +1530,20 @@ class MD5Token(Token):
             key = key.encode('UTF-8')
         return abs(varint_unpack(md5(key).digest()))
 
-    def __init__(self, token):
-        """ `token` should be an int or string representing the token. """
-        self.value = int(token)
-
 
 class BytesToken(Token):
     """
     A token for ``ByteOrderedPartitioner``.
     """
 
-    def __init__(self, token_string):
-        """ `token_string` should be string representing the token. """
-        if not isinstance(token_string, six.string_types):
-            raise TypeError(
-                "Tokens for ByteOrderedPartitioner should be strings (got %s)"
-                % (type(token_string),))
-        self.value = token_string
+    @classmethod
+    def from_string(cls, token_string):
+        """ `token_string` should be the string representation from the server. """
+        # unhexlify works fine with unicode input in everythin but pypy3, where it Raises "TypeError: 'str' does not support the buffer interface"
+        if isinstance(token_string, six.text_type):
+            token_string = token_string.encode('ascii')
+        # The BOP stores a hex string
+        return cls(unhexlify(token_string))
 
 
 class TriggerMetadata(object):
@@ -1574,11 +1593,21 @@ class _SchemaParser(object):
             raise result
 
     def _query_build_row(self, query_string, build_func):
+        result = self._query_build_rows(query_string, build_func)
+        return result[0] if result else None
+
+    def _query_build_rows(self, query_string, build_func):
         query = QueryMessage(query=query_string, consistency_level=ConsistencyLevel.ONE)
-        response = self.connection.wait_for_response(query, self.timeout)
-        result = dict_factory(*response.results)
-        if result:
-            return build_func(result[0])
+        responses = self.connection.wait_for_responses((query), timeout=self.timeout, fail_on_error=False)
+        (success, response) = responses[0]
+        if success:
+            result = dict_factory(*response.results)
+            return [build_func(row) for row in result]
+        elif isinstance(response, InvalidRequest):
+            log.debug("user types table not found")
+            return []
+        else:
+            raise response
 
 
 class SchemaParserV22(_SchemaParser):
@@ -1687,6 +1716,11 @@ class SchemaParserV22(_SchemaParser):
         where_clause = bind_params(" WHERE keyspace_name = %s AND type_name = %s", (keyspace, type), _encoder)
         return self._query_build_row(self._SELECT_TYPES + where_clause, self._build_user_type)
 
+    def get_types_map(self, keyspaces, keyspace):
+        where_clause = bind_params(" WHERE keyspace_name = %s", (keyspace,), _encoder)
+        types = self._query_build_rows(self._SELECT_TYPES + where_clause, self._build_user_type)
+        return dict((t.name, t) for t in types)
+
     def get_function(self, keyspaces, keyspace, function):
         where_clause = bind_params(" WHERE keyspace_name = %%s AND function_name = %%s AND %s = %%s" % (self._function_agg_arument_type_col,),
                                    (keyspace, function.name, function.argument_types), _encoder)
@@ -1764,12 +1798,9 @@ class SchemaParserV22(_SchemaParser):
             comparator = types.lookup_casstype(row["comparator"])
             table_meta.comparator = comparator
 
-            if issubclass(comparator, types.CompositeType):
-                column_name_types = comparator.subtypes
-                is_composite_comparator = True
-            else:
-                column_name_types = (comparator,)
-                is_composite_comparator = False
+            is_dct_comparator = issubclass(comparator, types.DynamicCompositeType)
+            is_composite_comparator = issubclass(comparator, types.CompositeType)
+            column_name_types = comparator.subtypes if is_composite_comparator else (comparator,)
 
             num_column_name_components = len(column_name_types)
             last_col = column_name_types[-1]
@@ -1783,7 +1814,8 @@ class SchemaParserV22(_SchemaParser):
 
             if column_aliases is not None:
                 column_aliases = json.loads(column_aliases)
-            else:
+
+            if not column_aliases:  # json load failed or column_aliases empty PYTHON-562
                 column_aliases = [r.get('column_name') for r in clustering_rows]
 
             if is_composite_comparator:
@@ -1806,10 +1838,10 @@ class SchemaParserV22(_SchemaParser):
 
                     # Some thrift tables define names in composite types (see PYTHON-192)
                     if not column_aliases and hasattr(comparator, 'fieldnames'):
-                        column_aliases = comparator.fieldnames
+                        column_aliases = filter(None, comparator.fieldnames)
             else:
                 is_compact = True
-                if column_aliases or not col_rows:
+                if column_aliases or not col_rows or is_dct_comparator:
                     has_value = True
                     clustering_size = num_column_name_components
                 else:
@@ -1854,7 +1886,7 @@ class SchemaParserV22(_SchemaParser):
                 if len(column_aliases) > i:
                     column_name = column_aliases[i]
                 else:
-                    column_name = "column%d" % i
+                    column_name = "column%d" % (i + 1)
 
                 data_type = column_name_types[i]
                 cql_type = _cql_from_cass_type(data_type)
@@ -2091,6 +2123,7 @@ class SchemaParserV3(SchemaParserV22):
     recognized_table_options = (
         'bloom_filter_fp_chance',
         'caching',
+        'cdc',
         'comment',
         'compaction',
         'compression',
@@ -2453,14 +2486,14 @@ class MaterializedViewMetadata(object):
         return self.as_cql_query(formatted=True) + ";"
 
 
-def get_schema_parser(connection, timeout):
-    server_version = connection.server_version
+def get_schema_parser(connection, server_version, timeout):
     if server_version.startswith('3'):
         return SchemaParserV3(connection, timeout)
     else:
         # we could further specialize by version. Right now just refactoring the
         # multi-version parser we have as of C* 2.2.0rc1.
         return SchemaParserV22(connection, timeout)
+
 
 def _cql_from_cass_type(cass_type):
     """

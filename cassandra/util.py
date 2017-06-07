@@ -924,6 +924,13 @@ class Time(object):
         """
         return self.nanosecond_time % Time.SECOND
 
+    def time(self):
+        """
+        Return a built-in datetime.time (nanosecond precision truncated to micros).
+        """
+        return datetime.time(hour=self.hour, minute=self.minute, second=self.second,
+                             microsecond=self.nanosecond // Time.MICRO)
+
     def _from_timestamp(self, t):
         if t >= Time.DAY:
             raise ValueError("value must be less than number of nanoseconds in a day (%d)" % Time.DAY)
@@ -966,6 +973,8 @@ class Time(object):
                           microsecond=self.nanosecond // Time.MICRO) == other
 
     def __lt__(self, other):
+        if not isinstance(other, Time):
+            return NotImplemented
         return self.nanosecond_time < other.nanosecond_time
 
     def __repr__(self):
@@ -1054,6 +1063,8 @@ class Date(object):
             return False
 
     def __lt__(self, other):
+        if not isinstance(other, Date):
+            return NotImplemented
         return self.days_from_epoch < other.days_from_epoch
 
     def __repr__(self):
@@ -1101,7 +1112,7 @@ else:
         WSAAddressToStringA = ctypes.windll.ws2_32.WSAAddressToStringA
     else:
         def not_windows(*args):
-            raise Exception("IPv6 addresses cannot be handled on Windows. "
+            raise OSError("IPv6 addresses cannot be handled on Windows. "
                             "Missing ctypes.windll")
         WSAStringToAddressA = not_windows
         WSAAddressToStringA = not_windows
@@ -1170,4 +1181,15 @@ def _positional_rename_invalid_identifiers(field_names):
             or name[0].isdigit()
             or name.startswith('_')):
             names_out[index] = 'field_%d_' % index
+    return names_out
+
+
+def _sanitize_identifiers(field_names):
+    names_out = _positional_rename_invalid_identifiers(field_names)
+    if len(names_out) != len(set(names_out)):
+        observed_names = set()
+        for index, name in enumerate(names_out):
+            while names_out[index] in observed_names:
+                names_out[index] = "%s_" % (names_out[index],)
+            observed_names.add(names_out[index])
     return names_out
